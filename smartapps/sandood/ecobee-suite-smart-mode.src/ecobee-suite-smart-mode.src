@@ -721,8 +721,8 @@ private def getWUTemp(type) {
         		atomicState.dewpoint = dewpointNow
             } else {
             	def hum = wdata.current_observation.relative_humidity
-                if (hum && hum.contains('%')) {
-                	hum = hum[0..-1].toBigDecimal()		// strip off the trailing '%' sign
+                if (hum && hum.contains('%')) hum = (hum-'%').toInteger()		// strip off the trailing '%' sign
+                if (hum.isNumber()) {
                 	dewpointNow = calculateDewpoint( tempnow, hum, (isMetric?'C':'F'))
                 }
             }
