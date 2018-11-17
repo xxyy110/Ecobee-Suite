@@ -723,7 +723,7 @@ private def getWUTemp(type) {
             	def hum = wdata.current_observation.relative_humidity
                 if (hum && hum.contains('%')) hum = (hum-'%').toInteger()		// strip off the trailing '%' sign
                 if (hum.isNumber()) {
-                	dewpointNow = calculateDewpoint( tempnow, hum, (isMetric?'C':'F'))
+                	dewpointNow = calculateDewpoint( tempNow, hum, (isMetric?'C':'F'))
                 }
             }
             LOG("Dewpoint is: ${dewpointNow}°",2,null,'info')
