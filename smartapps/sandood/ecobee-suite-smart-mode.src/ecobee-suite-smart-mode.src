@@ -39,9 +39,11 @@
  *	1.6.14 - Updated to remove use of *SetpointDisplay
  *  1.6.15 - Fixed external temp range limiter; should now work with either F/C temperature scales
  *	1.6.16 - Fixed initialization error when using SmartThings Sensors
- *	1/6/16a- Added more logging for PWS, calculate dewpoint if not provided by WU
+ *	1.6.17 - Added more logging for PWS, calculate dewpoint if not provided by WU
+ *	1.6.18 - Switched Zip/GPS external temp source to new getTwcConditions
+ *	1.6.19 - Added support for Ambient Weather Station V3
  */
-def getVersionNum() { return "1.6.16a" }
+def getVersionNum() { return "1.6.19" }
 private def getVersionLabel() { return "Ecobee Suite Smart Mode Helper, version ${getVersionNum()}" }
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -77,15 +79,15 @@ def mainPage() {
 				input(name: 'tempSource', title: 'Monitor this weather source', type: 'enum', required: true, multiple: false, description: 'Tap to choose...', 
                 	options:[
                     	'ecobee':"Ecobee Thermostat's Weather", 
-                    	'location':'SmartThings Weather for Location', 
+                    	'location':"SmartThings/TWC Weather for ${location.name}", 
                         'sensors':'SmartThings Sensors',
-                        'station':'SmartThings Weather Station',
-                        'wunder':'Weather Underground Station'
+                        'station':'SmartThings-based Weather Station DTH',
+                        'wunder':'Weather Underground Station (obsolete)'
                     ], submitOnChange: true
                 )
 				if (tempSource) {
 					if (tempSource == 'location') {
-                    	paragraph "Using SmartThings weather for the current location (${location.name})."
+                    	paragraph "Using The Weather Company weather for the current location (${location.name})."
                         if (!settings.latLon) input(name: "zipCode", type: 'text', title: 'Zipcode (Default is location Zip code)', defaultValue: getZIPcode(), required: true, submitOnChange: true )
                         if (location.latitude && location.longitude) input(name: "latLon", type: 'bool', title: 'Use SmartThings hub\'s GPS coordinates instead (better precision)?', submitOnChange: true)
 						input(name: 'locFreq', type: 'enum', title: 'Temperature check frequency (minutes)', required: true, multiple: false, description: 'Tap to choose...', 
@@ -109,6 +111,8 @@ def mainPage() {
                         		multiple: false, hideWhenEmpty: true)
                         input(name: "meteoWeather", type: "device.meteobridgeWeatherStation", title: 'Which Meteobridge Weather Station?', description: "Tap to choose...", required: false, 
                         		multiple: false, hideWhenEmpty: true)
+                        input(name: "ambientWeather", type: "device.ambientWeatherStationV3", title: 'Which Ambient Weather Station?', description: "Tap to choose...", required: false, 
+                        		multiple: false, hideWhenEmpty: true)        
                     } else if (tempSource == "wunder") {
                     	paragraph "Using a specific Weather Underground Weather Station"
 						input(name: 'stationID', type: 'string', title: 'Enter WeatherUnderground Station identifier', description: "Tap to choose...", 
@@ -278,7 +282,7 @@ def initialize() {
                         LOG("Humidity is: ${h}%",3,null,'info')
                 		def d = calculateDewpoint( t, h, unit )
             			atomicState.dewpoint = d
-                        LOG("Dewpoint is: ${d}°",3,null,'info')
+                        LOG("Dewpoint is: ${d}°${gu}",3,null,'info')
                    	}
                 }
             	tempNow = t 
@@ -302,7 +306,7 @@ def initialize() {
                         	LOG("Humidity is: ${h}%",3,null,'info')
                 			def d = calculateDewpoint( t, h, unit )
                             atomicState.dewpoint = d
-                            LOG("Dewpoint is: ${d}°",3,null,'info')
+                            LOG("Dewpoint is: ${d}°${gu}",3,null,'info')
                         }
                     }
                 	tempNow = t 
@@ -316,7 +320,7 @@ def initialize() {
                     if (latest.value.isNumber()) {
                     	def d = roundIt(latest.numberValue, (latest.unit=='C'?2:1))
                         atomicState.dewpoint = d
-                        LOG("Dewpoint is: ${d}°",3,null,'info')
+                        LOG("Dewpoint is: ${d}°${gu}",3,null,'info')
                     }
                 }
             	subscribe(settings.smartWeather2, 'temperature', tempChangeHandler)
@@ -333,7 +337,24 @@ def initialize() {
                     if (latest.value.isNumber()) {
                     	def d = roundIt(latest.numberValue, (latest.unit=='C'?2:1))
                         atomicState.dewpoint = d
-                        LOG("Dewpoint is: ${d}°",3,null,'info')
+                        LOG("Dewpoint is: ${d}°${gu}",3,null,'info')
+                    }
+                }
+            	subscribe(settings.meteoWeather, 'temperature', tempChangeHandler)
+                latest = settings.meteoWeather.currentState('temperature')
+            	if (latest.value.isNumber()) { 
+                	tempNow = roundIt(latest.numberValue, (latest.unit=='C'?2:1))
+                    temperatureUpdate(tempNow) 
+                }
+            } else if (settings.ambientWeather) {
+            	def latest
+                if (settings.dewBelowOverride) {
+                	subscribe(settings.meteoWeather, 'dewPoint', dewpointChangeHandler)
+                	latest = settings.meteoWeather.currentState('dewPoint')
+                    if (latest.value.isNumber()) {
+                    	def d = roundIt(latest.numberValue, (latest.unit=='C'?2:1))
+                        atomicState.dewpoint = d
+                        LOG("Dewpoint is: ${d}°${gu}",3,null,'info')
                     }
                 }
             	subscribe(settings.meteoWeather, 'temperature', tempChangeHandler)
@@ -355,7 +376,7 @@ def initialize() {
             	if (latest.value.isNumber()) {
                 	def d = roundIt(latest.numberValue, (latest.unit=='C'?2:1))
                 	atomicState.dewpoint = d
-                    LOG("Dewpoint is: ${d}°",3,null,'info')
+                    LOG("Dewpoint is: ${d}°${gu}",3,null,'info')
                 }
             }
             subscribe(theStat, 'weatherTemperature', tempChangeHandler)
@@ -380,10 +401,10 @@ def initialize() {
     atomicState.locModeEnabled = theModes ? theModes.contains(location.mode) : true
     if (tempNow) {
     	atomicState.temperature = tempNow
-    	LOG("Initialization complete...current temperature is ${tempNow}°",2,null,'info')
+    	LOG("Initialization complete...current temperature is ${tempNow}°${gu}",2,null,'info')
         return true
     } else {
-    	LOG("Initialization error...invalid temperature: ${tempNow}° - please check settings and retry", 2, null, 'error')
+    	LOG("Initialization error...invalid temperature: ${tempNow}°${gu} - please check settings and retry", 2, null, 'error')
         return false
     }
 }
@@ -426,13 +447,13 @@ def insideChangeHandler(evt) {
                     def tid = getDeviceId(evt.device.deviceNetworkId)
                     if ((cMode == 'off') && anyReservations( tid, 'modeOff' )) {
                         // if ANYBODY (including me) has a reservation on this being off, I can't turn it back on
-                        LOG("${evt.device.displayName} inside temp is ${theTemp}°, but can't change to ${newMode} since ${getGuestList(tid,'offMode').toString()[1..-2]} have offMode reservations",2,null,'warn')
+                        LOG("${evt.device.displayName} inside temp is ${theTemp}°${evt.unit}, but can't change to ${newMode} since ${getGuestList(tid,'offMode').toString()[1..-2]} have offMode reservations",2,null,'warn')
                         // Here's where we could subscribe to reservations and re-evaluate. For now, just wait for another inside Temp Change to occur
                     } else {
                         // not currently off or there are no modeOff reservations, change away!
                         cancelReservation(tid, 'modeOff' )
                         evt.device.setThermostatMode(newMode)
-                        LOG("${evt.device.displayName} temp is ${theTemp}°, changed thermostat to ${newMode} mode",3,null,'trace')
+                        LOG("${evt.device.displayName} temp is ${theTemp}°${evt.unit}, changed thermostat to ${newMode} mode",3,null,'trace')
                         sendMessage("Thermostat ${evt.device.displayName} temperature is ${theTemp}°, so I changed it to ${newMode} mode")
                     }
                 }
@@ -485,7 +506,7 @@ def tempChangeHandler(evt) {
                         LOG("Humidity is: ${h}%",3,null,'info')
                 		def d = calculateDewpoint( t, h, evt.unit )
             			atomicState.dewpoint = d
-                        LOG("Dewpoint is: ${d}°",3,null,'info')
+                        LOG("Dewpoint is: ${d}°${evt.unit}",3,null,'info')
                         runIn(2, atomicTempUpdater, [overwrite: true] )		// humidity might be updated also
                         return
                    	}
@@ -496,7 +517,7 @@ def tempChangeHandler(evt) {
                         LOG("Humidity is: ${h}%",3,null,'info')
                 		def d = calculateDewpoint( t, h, unit )
                         atomicState.dewpoint = d
-                        LOG("Dewpoint is: ${d}°",3,null,'info')
+                        LOG("Dewpoint is: ${d}°${evt.unit}",3,null,'info')
                         runIn(2, atomicTempUpdater, [overwrite: true] )		// humidity might be updated also
                         return
                     }
@@ -515,7 +536,7 @@ def dewpointChangeHandler(evt) {
 	if (evt.value.isNumber()) {
     	def d = roundIt(evt.numberValue, (evt.unit=='C'?2:1))
     	atomicState.dewpoint = d
-        LOG("Dewpoint is: ${d}°",3,null,'info')
+        LOG("Dewpoint is: ${d}°${evt.unit}",3,null,'info')
         runIn(2, atomicTempUpdater, [overwrite: true]) 		// wait for temp to be updated also
     }
 }
@@ -528,7 +549,7 @@ def humidityChangeHandler(evt) {
         LOG("Humidity is: ${evt.numberValue}%",3,null,'info')
     	def d = calculateDewpoint(t, evt.numberValue, u)
         atomicState.dewpoint = d
-        LOG("Dewpoint is: ${d}°",3,null,'info')
+        LOG("Dewpoint is: ${d}°${getTemperatureScale()}",3,null,'info')
         runIn(2, atomicTempUpdater, [overwrite: true])
     }
 }
@@ -541,13 +562,15 @@ def temperatureUpdate( temp ) {
 	if (temp?.isNumber()) temperatureUpdate(temp as BigDecimal)
 }
 def temperatureUpdate( BigDecimal temp ) {
+	def unit = getTemperatureScale()
     if (!temp) {
-    	LOG("Ignoring invalid temperature: ${temp}°", 2, null, 'warn')
+    	LOG("Ignoring invalid temperature: ${temp}°${unit}", 2, null, 'warn')
         return false
     }
-    temp = roundIt(temp, (getTemperatureScale()=='C'?2:1))
+    
+    temp = roundIt(temp, (unit=='C'?2:1))
     atomicState.temperature = temp
-    LOG("Temperature is: ${temp}°",3,null,'info')
+    LOG("Temperature is: ${temp}°${unit}",3,null,'info')
     
     def okMode = theModes ? theModes.contains(location.mode) : true
     if (okMode) {
@@ -645,7 +668,7 @@ def temperatureUpdate( BigDecimal temp ) {
                 			changeNames += changeNames ? ", ${it.displayName}" : it.displayName
 						} else {
                     		// somebody else still has a 'modeOff' reservation so we can't turn it on
-                            def msg = "The temperature is ${temp}°, but I can't change ${it.displayName} to ${desiredMode} Mode because ${getGuestList(tid,'modeOff').toString()[1..-2]} hold 'modeOff' reservations"
+                            def msg = "The temperature is ${temp}°${unit}, but I can't change ${it.displayName} to ${desiredMode} Mode because ${getGuestList(tid,'modeOff').toString()[1..-2]} hold 'modeOff' reservations"
                             LOG(msg ,2,null,'warn')
                             sendMessage(msg)
                             // here's where we COULD subscribe to the reservations to see when we can turn it back on. For now, let's just let whomever is last deal with it
@@ -664,23 +687,64 @@ def temperatureUpdate( BigDecimal temp ) {
 		}
         def multi=0
         if (changeNames) {
-        	LOG("Temp is ${temp}°, changed ${changeNames} to ${desiredMode} mode",3,null,'trace')
-        	sendMessage("The temperature is ${temp}°, so I changed thermostat${changeNames.size() > 1?'s':''} ${changeNames} to ${desiredMode} mode")
+        	LOG("Temp is ${temp}°${unit}, changed ${changeNames} to ${desiredMode} mode",3,null,'trace')
+        	sendMessage("The temperature is ${temp}°${unit}, so I changed thermostat${changeNames.size() > 1?'s':''} ${changeNames} to ${desiredMode} mode")
         }
-        if (sameNames) LOG("Temp is ${temp}°, ${sameNames} already in ${desiredMode} mode",3,null,'info')
+        if (sameNames) LOG("Temp is ${temp}°${unit}, ${sameNames} already in ${desiredMode} mode",3,null,'info')
 	}
 }
 
 private def getZipTemp() {
-	return getWUTemp('zip')
+	return getTwcTemp('zip')
 }
 
 private def getGPSTemp() {
-	return getWUTemp('gps')
+	return getTwcTemp('gps')
 }
 
 private def getPwsTemp() {
 	return getWUTemp('pws')
+}
+
+private def getTwcTemp(type) {
+	def isMetric = (getTemperatureScale() == "C")
+	def source = (type == 'zip') ? settings.zipCode : ((type == 'gps')?"${location.latitude},${location.longitude}":null)
+    
+    def twcConditions = [:]
+    try {
+    	twcConditions = getTwcConditions(source)
+    } catch (e) {
+    	LOG("Error getting TWC Conditions: ${e}",1,null,'error')
+        return null
+    }
+    if (twcConditions) {
+    	LOG("Parsing TWC data",3,null,'info')
+        def tempNow
+    	def dewpointNow = -999.0
+    	tempNow = twcConditions.temperature
+        dewpointNow = twcConditions.temperatureDewPoint
+
+        if (tempNow?.isNumber()) {
+        	if (dewpointNow != -999.0) {
+        		atomicState.dewpoint = dewpointNow
+            } else {
+            	def hum = twcConditions.relativeHumidity
+                if (hum && hum.contains('%')) hum = (hum-'%').toInteger()		// strip off the trailing '%' sign
+                if (hum.isNumber()) {
+                	dewpointNow = calculateDewpoint( tempNow, hum, (isMetric?'C':'F'))
+                }
+                atomicState.dewpoint = dewpointNow
+            }
+            LOG("Dewpoint is: ${dewpointNow}°${isMetric?'C':'F'}",2,null,'info')
+        	temperatureUpdate(tempNow)
+            return tempNow
+        } else {
+        	LOG("Invalid temp returned ${newTemp}, ignoring...",2,null,'warn')
+            return null
+        }
+    }
+    LOG("Current conditions unavailable",1,null,'error')
+    return null
 }
 
 private def getWUTemp(type) {
@@ -689,7 +753,7 @@ private def getWUTemp(type) {
     def dewpointNow
     def source = (type == 'zip') ? settings.zipCode : ((type == 'gps')?"${location.latitude},${location.longitude}":settings.stationID)
 	Map wdata = getWeatherFeature('conditions', source)
-    LOG("Requesting WU data for source: ${source}",2,null,'info')
+    LOG("Requesting WU data for source: ${source}",3,null,'info')
     if (wdata && wdata.response) {
     	//LOG("conditions: ${wdata.response}",4,null,'trace')
 		if (wdata.response.containsKey('error')) {
@@ -708,7 +772,7 @@ private def getWUTemp(type) {
     	return null
     }
     if (wdata.current_observation) { 
-    	LOG("Parsing WU data for station: ${wdata.current_observation.station_id}",2,null,'info')
+    	LOG("Parsing WU data for station: ${wdata.current_observation.station_id}",3,null,'info')
     	if (!isMetric) {
 			if (wdata.current_observation.temp_f?.isNumber()) tempNow = wdata.current_observation.temp_f.toBigDecimal()
             if (wdata.current_observation.dewpoint_f?.isNumber()) dewpointNow = wdata.current_observation.dewpoint_f.toBigDecimal()
@@ -725,8 +789,9 @@ private def getWUTemp(type) {
                 if (hum.isNumber()) {
                 	dewpointNow = calculateDewpoint( tempNow, hum, (isMetric?'C':'F'))
                 }
+                atomicState.dewpoint = dewpointNow
             }
-            LOG("Dewpoint is: ${dewpointNow}°",2,null,'info')
+            LOG("Dewpoint is: ${dewpointNow}°${isMetric?'C':'F'}",2,null,'info')
         	temperatureUpdate(tempNow)
             return tempNow
         } else {
