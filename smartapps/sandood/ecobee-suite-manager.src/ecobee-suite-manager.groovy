@@ -43,12 +43,35 @@
  *	1.4.19- setHold/nextTransition to currentClimate setpoints is same as resumeProgram
  *	1.4.20- Added setHumidifierMode() & setDehumidifierMode()
  *	1.4.21- Queue add/delete program updates to effect only a single API call
- *	1.5.00 - Release number synchronization
- */  
-import groovy.json.JsonOutput
-
-def getVersionNum() { return "1.5.00" }
+ *	1.5.00- Release number synchronization
+ *	1.5.01- pollEcobeeAPI() now uses asynchttp
+ *	1.5.02-	Cleanup of obsolete code
+ *	1.5.03- Converted all temperature calculations to BigDecimal for better precision/rounding
+ *	1.5.04- Added outdoor Dewpoint, Humidity & Barometric Pressure for Smart Mode's use
+ *	1.5.05- Added support for multiple SMS numbers (Contacts being deprecated by ST)
+ *	1.6.00- Release number synchronization
+ *	1.6.10- Re-implemented reservations 
+ *	1.6.11- Removed location.contactBook support - deprecated by SmartThings
+ *	1.6.12- Cleaned up null values during climate changes
+ *	1.6.13- Cleaned up setpoint/setpointDisplay stuff (added iOS/Android preference setting)
+ *	1.6.14- Fixed Sensor temp 'unknown' --> null
+ *	1.6.15- Cleaned up initialization process
+ *	1.6.16- Fixed case of Home/Away when Auto Home/Away
+ *	1.6.17- Fixed sensor off-line error handling
+ *	1.6.18- Ensure test/dummy children are always deleted
+ *	1.6.19-	Add hubId to device creation; cleanup removeChildDevice 
+ *	1.6.20- Fixed unintended recursion
+ *  1.6.21- Improve error logging
+ *	1.6.22- SmartThings started throwing errors on some Canadian zipcodes - we now catch these and use geographic coordinates instead...
+ *	1.6.23- Added setProgramSetpoints() support for Smart Mode Helper
+ */
+def getVersionNum() { return "1.6.23" }
 private def getVersionLabel() { return "Ecobee Suite Manager, version ${getVersionNum()}" }
+
+include 'asynchttp_v1'
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
 private def getHelperSmartApps() {
 	return [ 
 		[name: "ecobeeContactsChild", appName: "ecobee Suite Open Contacts",  
@@ -65,7 +88,7 @@ private def getHelperSmartApps() {
 			 title: "New Smart Circulation Helper..."],
 		[name: "ecobeeModeChild", appName: "ecobee Suite Smart Mode",
         	namespace: "sandood", multiple: true,
-            title: "New Smart Mode Helper..."],
+            title: "New Smart Mode & Setpoints Helper..."],
         [name: "ecobeeRoomChild", appName: "ecobee Suite Smart Room",
         	namespace: "sandood", multiple: true,
             title: "New Smart Room Helper..."],
@@ -103,7 +126,7 @@ preferences {
 	page(name: "sensorsPage")
     page(name: "preferencesPage")
     page(name: "askAlexaPage")
-    page(name: "addWatchdogDevicesPage")
+    // page(name: "addWatchdogDevicesPage")
     page(name: "helperSmartAppsPage")    
     // Part of debug Dashboard
     page(name: "debugDashboardPage")
@@ -130,7 +153,9 @@ def mainPage() {
     if (!atomicState.initialized) {
     	deviceHandlersInstalled = testForDeviceHandlers()
     	readyToInstall = deviceHandlersInstalled
-	}
+	} else {
+    	removeChildDevices( getAllChildDevices(), true )	// remove any lingering temp devices
+    }
     if (atomicState.initialized) { readyToInstall = true }
     
 	dynamicPage(name: "mainPage", title: "Welcome to ${getVersionLabel()}", install: readyToInstall, uninstall: false, submitOnChange: true) {
@@ -373,9 +398,13 @@ def askAlexaPage() {
 def preferencesPage() {
     LOG("=====> preferencesPage() entered. settings: ${settings}", 5)
     dynamicPage(name: "preferencesPage", title: "Update Ecobee Suite Manager Preferences", nextPage: "") {
-		section("Notifications are only sent when the Ecobee API connection is lost and unrecoverable, at most 1 per hour. You can have them sent ${location.contactBookEnabled?'to selected Contacts':'via SMS'} or as a Push notification (default).") {
-            input(name: 'recipients', title: 'Send notifications to', descriptions: 'Contacts', type: 'contact', required: false, multiple: true) {
-            	input "phone", "phone", title: "Send SMS notifications to", description: "Phone Number", required: false }
+		section("Notifications are only sent when the Ecobee API connection is lost and unrecoverable, at most 1 per hour." +
+					" You can have them sent ${location.contactBookEnabled?'to selected Contacts':'via SMS'} or as a Push notification (default).") {
+           	paragraph "You can enter multiple phone numbers seperated by a semi-colon (;)"
+            input "phone", "string", title: "Send SMS notifications to", description: "Phone Number", required: false 
+        }
+        section("Select your mobile device type to enable device-specific optimizations") {
+        	input(name: 'mobile', type: 'enum', options: ["Android", "iOS"], title: 'Tap to select your mobile device type', defaultValue: 'iOS', submitOnChange: true, required: true, multiple: false)
         }
       	section("How long do you want Hold events to last?") {
             input(name: "holdType", title:"Select Hold Type", type: "enum", required:false, multiple:false, defaultValue: "Until I Change", submitOnChange: true, description: "Until I Change", 
@@ -390,16 +419,11 @@ def preferencesPage() {
             input(name: "smartAuto", title:"Use Smart Auto Temperature Adjust?", type: "bool", required:false, defaultValue: false, description: "")
         }    
         section("How frequently do you want to poll the Ecobee cloud for changes?") {   
-            input(name: "pollingInterval", title:"Polling Interval (in Minutes)", type: "enum", required:false, multiple:false, defaultValue:5, description: "5", options:["1", "2", "3", "5", "10", "15", "30"])
+            input(name: "pollingInterval", title:"Polling Interval (in Minutes)", type: "enum", required:false, multiple:false, defaultValue:5, description: "5", options:["1", "2", "3", "5", "10", "15", "30", "60"])
         }
         section("Showing a Thermostat as a separate Sensor is useful if you need to access the actual temperature in the room where the Thermostat is located and not just the (average) temperature displayed on the Thermostat") {
             input(name: "showThermsAsSensor", title:"Include Thermostats as a separate Ecobee Sensor?", type: "bool", required:false, defaultValue: false, description: "")
         }
-//		if (settings.pollingInterval?.toInteger() > 2) {
-//			section("Monitoring external devices can be used to drive polling and the watchdog events. Be warned, however, not to select too many devices or devices that will send too many events as this can cause issues with the connection.\nBe sure NOT to select any Ecobee devices!") {
-//            	input(name: "useWatchdogDevices", title:"Monitor external devices to drive additional polling and watchdog events?", type: "bool", required:false, description: "", defaultValue:false)
-//            }
-//        }
         section("Set the pause between pressing the setpoint arrows and initiating the API calls. The pause needs to be long enough to allow you to click the arrow again for changing by more than one degree.") {
             input(name: "arrowPause", title:"Delay timer value after pressing setpoint arrows", type: "enum", required:false, multiple:false, description: "4", defaultValue:5, options:["1", "2", "3", "4", "5"])
 		}
@@ -411,22 +435,6 @@ def preferencesPage() {
             input(name: "debugLevel", title:"Debug Logging Level", type: "enum", required:false, multiple:false, defaultValue:2, description: "2", options:["5", "4", "3", "2", "1", "0"])            
         }
 	}
-}
-
-def addWatchdogDevicesPage() {
-	LOG("Displaying the Watchdog Device Selection page next...", 5, null, "trace")
-    dynamicPage(name: "addWatchdogDevicesPage", title: "Select Watchdog Devices", nextPage: "") {
-		section("Select device(s) that you wish to subscribe to in order to create additional polling events. " +
-            	"Do NOT select too many devices or devices that will cause excess polling. " + 
-                "NOTE: Do NOT select any Ecobee devices managed by this SmartApp, as this can cause excess circular polling.") {
-     		input(name: "watchdogMotion", type:"capability.motionSensor", title: "Select Motion Sensor(s)", required:false, multiple:true)
-            input(name: "watchdogTemp", type:"capability.temperatureMeasurement", title: "Select Temperature Measurement Device(s)", required:false, multiple:true)
-            input(name: "watchdogSwitch", type:"capability.switch", title: "Select Switch(es)", required:false, multiple:true)
-            input(name: "watchdogBattery", type:"capability.battery", title: "Select Battery(ies)", required:false, multiple:true)
-            input(name: "watchdogHumidity", type:"capability.relativeHumidityMeasurement", title: "Select Humidity Sensor(s)", required:false, multiple:true)
-            input(name: "watchdogLuminance", type:"capability.illuminanceMeasurement", title: "Select Illuminance Sensor(s)", required:false, multiple:true)
-        }
- 	}
 }
 
 def debugDashboardPage() {
@@ -525,28 +533,68 @@ def helperSmartAppsPage() {
 
 // Preference Pages Helpers
 private def Boolean testForDeviceHandlers() {
-	if (atomicState.runTestOnce != null) { return atomicState.runTestOnce }
+	if (atomicState.runTestOnce != null) { 
+    	List myChildren = getAllChildDevices()
+        if (atomicState.runTestOnce == false) {
+    		removeChildDevices( myChildren, true )	// Delete any leftover dummy (test) children
+            atomicState.runTestOnce = null
+            return false
+    	} else {
+        	return true
+        }
+    }
     
     def DNIAdder = now().toString()
     def d1
     def d2
-    def success = true
+    def success
+    List myChildren = getAllChildDevices()
+    if (myChildren.size() > 0) removeChildDevices( myChildren, true )	// Delete my test children
     
 	try {    	
-		d1 = addChildDevice(app.namespace, getChildThermostatName(), "dummyThermDNI-${DNIAdder}", null, ["label":"Ecobee Suite Thermostat:TestingForInstall", completedSetup:true])
-		d2 = addChildDevice(app.namespace, getChildSensorName(), "dummySensorDNI-${DNIAdder}", null, ["label":"Ecobee Suite Sensor:TestingForInstall", completedSetup:true])
+		d1 = addChildDevice(app.namespace, getChildThermostatName(), "dummyThermDNI-${DNIAdder}", location.hubs[0]?.id, ["label":"Ecobee Suite Thermostat:TestingForInstall", completedSetup:true])
+		d2 = addChildDevice(app.namespace, getChildSensorName(), "dummySensorDNI-${DNIAdder}", location.hubs[0]?.id, ["label":"Ecobee Suite Sensor:TestingForInstall", completedSetup:true])
+        if ((d1 != null) && (d2 != null)) success = true
 	} catch (physicalgraph.app.exception.UnknownDeviceTypeException e) {
 		LOG("You MUST add the ${getChildThermostatName()} and ${getChildSensorName()} Device Handlers to the IDE BEFORE running the setup.", 1, null, "error")
 		success = false
 	}
+    try {
+        if (d1) deleteChildDevice("dummyThermDNI-${DNIAdder}") 
+    	if (d2) deleteChildDevice("dummySensorDNI-${DNIAdder}")
+    } catch (Exception e) {
+    	LOG("Error ${e} deleting test devices (${d1}, ${d2})",1,null,'warn')
+    }
     
+    runIn(5, delayedRemoveChildren, [overwrite: true])
     atomicState.runTestOnce = success
-    
-    if (d1) deleteChildDevice("dummyThermDNI-${DNIAdder}") 
-    if (d2) deleteChildDevice("dummySensorDNI-${DNIAdder}") 
     
     return success
 }
+
+def delayedRemoveChildren() {
+	def myChildren = getAllChildDevices()
+	if (myChildren.size() > 0) removeChildDevices( myChildren, true )
+}
+
+private removeChildDevices(devices, dummyOnly = false) {
+	if (devices != []) {
+    	LOG("Removing ${dummyOnly?'test':''} child devices",3,null,'trace')
+	} else {
+    	return		// nothing to remove
+    }
+    def devName
+    try {
+    	devices?.each {
+        	devName = it.displayName
+            LOG("Child: ${it.deviceNetworkId} - ${devName}",2,null,'trace')
+    		if (!dummyOnly || it?.deviceNetworkId?.startsWith('dummy')) deleteChildDevice(it.deviceNetworkId)
+    	}
+    } catch (Exception e) {
+    	LOG("Error ${e} removing device ${devName}",1,null,'warn')
+    }
+}
+
 // End Preference Pages Helpers
 
 // Ask Alexa Helpers
@@ -774,7 +822,7 @@ def connectionStatus(message, redirectUrl = null) {
 
 // Get the list of Ecobee Thermostats for use in the settings pages
 def getEcobeeThermostats() {	
-	LOG("====> getEcobeeThermostats() entered", 5)    
+	LOG("====> getEcobeeThermostats() entered", 2,null,'trace')    
  	def requestBody = '{"selection":{"selectionType":"registered","selectionMatch":"","includeRuntime":true,"includeSensors":true,"includeLocation":true,"includeProgram":true}}'
 	def deviceListParams = [
 			uri: apiEndpoint,
@@ -911,12 +959,20 @@ def getThermostatTypeName(stat) {
 }
 
 def installed() {
-	LOG("Installed with settings: ${settings}", 4)	
+	LOG("Installed with settings: ${settings}",2,null,'warn')	
 	initialize()
 }
 
+def uninstalled() {
+	LOG("Uninstalling...",2,null,'warn')
+    unschedule()
+    // unsubscribe()
+	removeChildDevices( getAllChildDevices(), false )	// delete all my children!
+    // Child apps are supposedly automatically deleted.
+}
+
 def updated() {	
-    LOG("Updated with settings: ${settings}", 4)	
+    LOG("Updated with settings: ${settings}",2,null,'warn')	
     
     if (!atomicState.atomicMigrate) {
     	LOG("updated() - Migrating state to atomicState...", 2, null, "warn")        
@@ -984,39 +1040,58 @@ def initialize() {
     atomicState.forcePoll = true				// make sure we get ALL the data after initialization
     atomicState.hourlyForcedUpdate = 0
     atomicState.needExtendedRuntime = true		// we'll stop getting it once we decide we don't need it
+   	if (!atomicState.reservations) atomicState.reservations = [:]
 
     getTimeZone()		// these will set/refresh atomicState.timeZone
     getZipCode()		// and atomicState.zipCode (because atomicState.forcePoll is true)
     
+   
     // get sunrise/sunset for the location of the thermostats (getZipCode() prefers thermostat.location.postalCode)
     // def sunriseAndSunset = (atomicState.zipCode != null) ? getSunriseAndSunset(zipCode: atomicState.zipCode) : getSunRiseAndSunset()
-    def sunriseAndSunset = getSunriseAndSunset(zipCode: atomicState.zipCode)
-    if (!(sunriseAndSunset.sunrise instanceof Date)) {
-    	// the zip code is invalid or didn't return the data as expected
- 		LOG("sunriseAndSunset not set as expected, using default hub location")
- 		sunriseAndSunset = getSunriseAndSunset()
- 	}
-    LOG("sunriseAndSunset == ${sunriseAndSunset}")
-    if(atomicState.timeZone) {
+    def sunriseAndSunset = null
+    if (atomicState.zipCode) {
+    	LOG("Trying to get sunrise/set using postal code '${atomicState.zipCode}'",1,null,'info')
+        try {
+    		sunriseAndSunset = getSunriseAndSunset(zipCode: atomicState.zipCode)
+        } catch (Exception e) {
+        	LOG("Failed to get sunrise/set using postal code: Exception: ${e}",1,null,'error')
+            sunriseAndSunset = null
+        }
+    } 
+    if (!sunriseAndSunset && location.longitude && location.latitude) {
+    	LOG("Trying to get sunrise/set using geographic coordinates for '${location.name}'",1,null,'info')
+    	sunriseAndSunset = getSunriseAndSunset()
+    } else {
+    	if (!sunriseAndSunset) LOG("*** INITIALIZATION ERROR *** PLEASE SET LATITUDE/LONGITUDE FOR LOCATION '${location.name}' IN YOUR MOBILE APP",1,null,'error')
+    }
+    def isOk = false
+    if (!sunriseAndSunset || (!(sunriseAndSunset.sunrise instanceof Date) || !(sunriseAndSunset.sunset instanceof Date))) {
+		LOG("Can't get valid sunrise/set times, using generic defaults (05:00-->18:00)",1,null,'warn')
+    } else {
+    	isOk = true
+        LOG("Got valid sunrise/set data: ${sunriseAndSunset}",1,null,'info')
+    }
+    if(isOk && atomicState.timeZone) {
+    	// using the thermostat's time zone
         atomicState.sunriseTime = sunriseAndSunset.sunrise.format("HHmm", TimeZone.getTimeZone(atomicState.timeZone)).toInteger()
         atomicState.sunsetTime = sunriseAndSunset.sunset.format("HHmm", TimeZone.getTimeZone(atomicState.timeZone)).toInteger()
-    } else if( (sunriseAndSunset !=  [:]) && (location != null) ) {
+    } else if( isOk ) {
         atomicState.sunriseTime = sunriseAndSunset.sunrise.format("HHmm").toInteger()
         atomicState.sunsetTime = sunriseAndSunset.sunset.format("HHmm").toInteger()
     } else {
-    	atomicState.sunriseTime = "0500".toInteger()
+        atomicState.sunriseTime = "0500".toInteger()
         atomicState.sunsetTime = "1800".toInteger()
     }
-	
+
 	// Must do this AFTER setting up sunrise/sunset
 	atomicState.timeOfDay = getTimeOfDay()
 	    
     // Setup initial polling and determine polling intervals
 	atomicState.pollingInterval = getPollingInterval()
-    atomicState.watchdogInterval = 15	// In minutes
+    atomicState.watchdogInterval = 10	// In minutes
     atomicState.reAttemptInterval = 15 	// In seconds
 	
-    if (state.initialized) {		
+    if (atomicState.initialized) {		
     	// refresh Thermostats and Sensor full lists
     	getEcobeeThermostats()
     	getEcobeeSensors()
@@ -1059,16 +1134,7 @@ def initialize() {
     subscribe(location, "sunset", sunsetEvent)
     subscribe(location, "sunrise", sunriseEvent)
     subscribe(location, "position", scheduleWatchdog)
-    
-//    if ( settings.useWatchdogDevices == true ) {
-//    	if ( settings.watchdogBattery?.size() > 0) { subscribe(settings.watchdogBattery, "battery", userDefinedEvent) }
-//        if ( settings.watchdogHumidity?.size() > 0) { subscribe(settings.watchdogHumidity, "humidity", userDefinedEvent) }
-//        if ( settings.watchdogLuminance?.size() > 0) { subscribe(settings.watchdogLuminance, "illuminance", userDefinedEvent) }
-//        if ( settings.watchdogMotion?.size() > 0) { subscribe(settings.watchdogMotion, "motion", userDefinedEvent) }
-//        if ( settings.watchdogSwitch?.size() > 0) { subscribe(settings.watchdogSwitch, "switch", userDefinedEvent) }
-//        if ( settings.watchdogTemp?.size() > 0) { subscribe(settings.watchdogTemp, "temperature", userDefinedEvent) }    
-//    }    
-    
+       
     // Schedule the various handlers
     LOG("Spawning scheduled events from initialize()", 5, null, "trace")
     if (settings.thermostats?.size() > 0) { 
@@ -1087,7 +1153,8 @@ def initialize() {
         atomicState.initializedEpic = nowTime
         atomicState.initializedDate = nowDate
 	}
-    LOG("${getVersionLabel()} - initialization complete",2,null,'info')
+    LOG("${getVersionLabel()} - initialization complete",1,null,'debug')
+    atomicState.versionLabel = getVersionLabel()
     return aOK
 }
 
@@ -1098,9 +1165,9 @@ private def createChildrenThermostats() {
 		def d = getChildDevice(dni)
 		if(!d) {        	
             try {
-				d = addChildDevice(app.namespace, getChildThermostatName(), dni, null, ["label":"EcobeeTherm: ${atomicState.thermostatsWithNames[dni]}", completedSetup:true])			
+				d = addChildDevice(app.namespace, getChildThermostatName(), dni, location.hubs[0]?.id, ["label":"EcobeeTherm: ${atomicState.thermostatsWithNames[dni]}", completedSetup:true])			
 			} catch (physicalgraph.app.exception.UnknownDeviceTypeException e) {
-            	LOG("You MUST add the ${getChildSensorName()} Device Handler to the IDE BEFORE running the setup.", 1, null, "error")
+            	LOG("You MUST add the ${getChildThermostatName()} Device Handler to the IDE BEFORE running the setup.", 1, null, "error")
                 return false
             }
             LOG("created ${d.displayName} with id ${dni}", 4, null, 'trace')
@@ -1120,7 +1187,7 @@ private def createChildrenSensors() {
 		def d = getChildDevice(dni)
 		if(!d) {        	
             try {
-				d = addChildDevice(app.namespace, getChildSensorName(), dni, null, ["label":"EcobeeSensor: ${atomicState.eligibleSensors[dni]}", completedSetup:true])
+				d = addChildDevice(app.namespace, getChildSensorName(), dni, location.hubs[0]?.id, ["label":"EcobeeSensor: ${atomicState.eligibleSensors[dni]}", completedSetup:true])
 			} catch (physicalgraph.app.exception.UnknownDeviceTypeException e) {
             	LOG("You MUST add the ${getChildSensorName()} Device Handler to the IDE BEFORE running the setup.", 1, null, "error")
                 return false
@@ -1141,23 +1208,49 @@ def appHandler(evt) {
     	LOG('appHandler(touch) event, forced poll',2,null,'info')
 		atomicState.forcePoll = true
         atomicState.getWeather = true	// update the weather also
+        pollEcobeeAPI('')
     	pollChildren(null, true)		// double force-poll
     }
 }
 
+// For thermostat reservations handling
+def isChildApp(String childId) {
+	def isChild = false
+    def children = getChildApps()
+    children.each {
+    	if (isChild || (it.id == childId)) {
+        	isChild = true
+        }
+    }
+    return isChild
+}
+String getChildAppName(String childId) {
+	String childName = null
+    def children = getChildApps()
+    children.each {
+    	if (!childName && (it.id == childId)) {
+        	childName = it.label
+        }
+    }
+    return childName
+}
+
 // NOTE: For this to work correctly getEcobeeThermostats() and getEcobeeSensors() should be called prior
 private def deleteUnusedChildren() {
-	LOG("deleteUnusedChildren() entered", 5, null, 'trace')    
+	LOG("deleteUnusedChildren() entered", 5, null, 'trace')
+    
+    // Always make sure that the dummy devices were deleted
+    removeChildDevices(getAllChildDevices(), true)		// Delete dummy devices
     
     if (settings.thermostats?.size() == 0) {
     	// No thermostats, need to delete all children
         LOG("Deleting All My Children!", 2, null, "warn")
-    	getAllChildDevices().each { deleteChildDevice(it.deviceNetworkId) }        
+    	removeChildDevices(getAllChildDevices(), false)         
     } else {
     	// Only delete those that are no longer in the list
         // This should be a combination of any removed thermostats and any removed sensors
         def allMyChildren = getAllChildDevices()
-        LOG("These are currently all of my childred: ${allMyChildren}", 4, null, "debug")
+        LOG("These are currently all of my children: ${allMyChildren}", 4, null, "debug")
         
         // Update list of "eligibleSensors"       
         def childrenToKeep = (thermostats ?: []) + (atomicState.eligibleSensors?.keySet() ?: [])
@@ -1165,7 +1258,7 @@ private def deleteUnusedChildren() {
         
     	def childrenToDelete = allMyChildren.findAll { !childrenToKeep.contains(it.deviceNetworkId) }        
 		if (childrenToDelete.size() > 0) {
-        	LOG("Ready to delete these devices. ${childrenToDelete}", 2, null, "warn")
+        	LOG("Ready to delete these devices: ${childrenToDelete}", 2, null, "warn")
         	childrenToDelete?.each { deleteChildDevice(it.deviceNetworkId) } //inherits from SmartApp (data-management)    
         }
     }    
@@ -1270,7 +1363,7 @@ def scheduleWatchdog(evt=null, local=false) {
         // do a forced update once an hour, just because (e.g., forces Hold Status to update completion date string)
         def counter = atomicState.hourlyForcedUpdate
         counter = (!counter) ? 1 : counter + 1
-        if (counter == 4) {
+        if (counter == 6) {
         	counter = 0
             atomicState.forcePoll = true
         }
@@ -1278,7 +1371,7 @@ def scheduleWatchdog(evt=null, local=false) {
 	}
     
     // Check to see if we have called too soon
-    def timeSinceLastWatchdog = (now() - atomicState.lastWatchdog) / 60000
+    def timeSinceLastWatchdog = (atomicState.lastWatchdog == null) ? 0 :(now() - atomicState.lastWatchdog) / 60000
     if ( timeSinceLastWatchdog < 1 ) {
     	if (debugLevel(4)) LOG("It has only been ${timeSinceLastWatchdog} since last scheduleWatchdog was called. Please come back later.", 4, null, "trace")
         return true
@@ -1377,7 +1470,7 @@ private def Boolean spawnDaemon(daemon="all", unsched=true) {
             if ( unsched ) { unschedule("pollScheduled") }
             if ( canSchedule() ) { 
             	LOG("Polling Interval == ${pollingInterval}", 4)
-            	if ((pollingInterval < 5) && (pollingInterval > 1)) {	// choices were 1,2,3,5,10,15,30
+            	if ((pollingInterval == 60) || (pollingInterval < 5) && (pollingInterval > 1)) {	// choices were 1,2,3,5,10,15,30
                 	LOG("Using schedule instead of runEvery with pollingInterval: ${pollingInterval}", 4, null, 'trace')
 					int randomSeconds = rand.nextInt(59)
 					schedule("${randomSeconds} 0/${pollingInterval} * * * ?", "pollScheduled")                    
@@ -1459,6 +1552,14 @@ def pollInit() {
 
 def pollChildren(deviceId=null,force=false) {
 	def startMS = now()
+    
+    // Just in case we need to re-initialize anything
+    def version = getVersionLabel()
+    if (atomicState.versionLabel != version) {
+    	LOG("Code updated: ${version}",1,null,'debug')
+        atomicState.versionLabel = version
+    }
+    
 	boolean debugLevelFour = debugLevel(4)
 	if (debugLevelFour) LOG("pollChildren() - deviceId ${deviceId}", 4, child, 'trace')
     def forcePoll
@@ -1497,29 +1598,31 @@ def pollChildren(deviceId=null,force=false) {
     if (!forcePoll) thermostatsToPoll = atomicState.changedThermostatIds
     // def checkedMS = now()
     
-    def results = false
-    def alertsUpdated = false
+    //def results = false
+    //def alertsUpdated = false
     String preText = debugLevel(2) ? '' : 'pollChildren() - ' 
     if (forcePoll || somethingChanged) {
-    	alertsUpdated = forcePoll || atomicState.alertsUpdated
+    	//alertsUpdated = forcePoll || atomicState.alertsUpdated
         def tids = []
         tids = thermostatsToPoll.split(",")
         String names = ""
         tids.each { names = names == "" ? getThermostatName(it) : names+", "+getThermostatName(it) }
-        LOG("${preText}Requesting updates for thermostat${thermostatsToPoll.contains(',')?'s':''} ${names} (${thermostatsToPoll})${forcePoll?' (forced)':''}", 2, null, 'info')
-    	results = pollEcobeeAPI(thermostatsToPoll)  // This will update the values saved in the state which can then be used to send the updates
-        if (results) {
-       		def polledMS = now()
-        	def prepTime = (polledMS-startMS)
-        	if (debugLevelFour) LOG("Completed prep (${prepTime}ms)",4,null,'trace')
-    		if (alertsUpdated) {
-        		if (prepTime > 11000) { runIn(2, 'generateAlertsAndEvents', [overwrite: true]) } else { generateAlertsAndEvents() }
-        	} else {
-        		if (prepTime > 11000) { runIn(2, 'generateTheEvents', [overwrite: true]) } else { generateTheEvents() }
-        	}
-        } else {
-        	LOG('pollEcobeeAPI returned false',1,null,'warn')
-        }
+        LOG("${preText}Polling thermostat${thermostatsToPoll.contains(',')?'s':''} ${names} (${thermostatsToPoll})${forcePoll?' (forced)':''}", 2, null, 'info')
+    	// results = pollEcobeeAPI(thermostatsToPoll)  
+        pollEcobeeAPI(thermostatsToPoll)		// This will queue the async request, and values will be generated and sent from pollEcobeeAPICallback
+//        if (results) {
+//			LOG('pollEcobeeAPI() returned true',4,null,'trace')
+//       	def polledMS = now()
+//        	def prepTime = (polledMS-startMS)
+//        	if (debugLevelFour) LOG("Completed prep (${prepTime}ms)",4,null,'trace')
+//    		if (alertsUpdated) {
+//        		if (prepTime > 11000) { runIn(2, 'generateAlertsAndEvents', [overwrite: true]) } else { generateAlertsAndEvents() }
+//        	} else {
+//        		if (prepTime > 11000) { runIn(2, 'generateTheEvents', [overwrite: true]) } else { generateTheEvents() }
+//        	}
+//        } else {
+//        	LOG('pollEcobeeAPI() returned false',1,null,'warn')
+//        }
 	} else {   	 
         LOG(preText+'No updates...', 2, null, 'trace')
     }
@@ -1530,7 +1633,8 @@ def generateAlertsAndEvents() {
 	generateTheEvents()
     def startMS = now()
     sendAlertEvents()
-    LOG("Sent alerts (${now()-startMS}ms)",2,null,'trace')
+    def allDone = now()
+    LOG("Alerts sent (${now()-startMS} / ${allDone-atomicState.pollEcobeeAPIStart}ms)",2,null,'trace')
 }
 
 def generateTheEvents() {
@@ -1545,7 +1649,8 @@ def generateTheEvents() {
     sensors?.each { DNI ->
        	if (DNI.value?.data) getChildDevice(DNI.key)?.generateEvent(DNI.value.data)
     }
-    /*if (debugLevelFour) */ LOG("Sent events (${now()-startMS}ms)",2,null,'trace')
+    def allDone = now()
+    /*if (debugLevelFour) */ LOG("Updates sent (${allDone-startMS} / ${allDone-atomicState.pollEcobeeAPIStart}ms)",2,null,'trace')
 }
 
 // enables child SmartApps to send events to child Smart Devices using only the DNI
@@ -1663,19 +1768,19 @@ private boolean checkThermostatSummary(thermostatIdsString) {
         atomicState.inTimeoutRetry = 0
 	} catch (groovyx.net.http.HttpResponseException e) {   
         result = false // this thread failed to get the summary
-        if ((e.statusCode == 500) && (e.response.data.status.code == 14) /*&& ((atomicState.authTokenExpires - now()) <= 0) */){
+        if ((e.statusCode == 500) && (e?.response?.data?.status?.code == 14) /*&& ((atomicState.authTokenExpires - now()) <= 0) */){
             LOG('checkThermostatSummary() - HttpResponseException occurred: Auth_token has expired', 3, null, "info")
             atomicState.action = "pollChildren"
             if (debugLevelFour) LOG( "Refreshing your auth_token!", 4, null, 'trace')
+            atomicState.inTimeoutRetry = 0
             if ( refreshAuthToken() ) {
                 // Note that refreshAuthToken will reschedule pollChildren if it succeeds in refreshing the token...
-                LOG('checkThermostatSummary() - Auth_token refreshed', 2, null, 'info')
+                LOG('Checking: Auth_token refreshed', 2, null, 'info')
             } else {
-                LOG('checkThermostatSummary() - Auth_token refresh failed', 1, null, 'error')
+                LOG('Checking: Auth_token refresh failed', 1, null, 'error')
             }
-            atomicState.inTimeoutRetry = 0
         } else {
-        	LOG("checkThermostatSummary() - HttpResponseException: ${e} StatusCode: ${e.statusCode} response.data.status.code: ${e.response.data.status.code}", 1, null, "error")
+        	LOG("checkThermostatSummary() - HttpResponseException: ${e} StatusCode: ${e?.statusCode} response.data.status.code: ${e?.response?.data?.status?.code}", 1, null, "error")
         }
     } catch (java.util.concurrent.TimeoutException e) {
     	LOG("checkThermostatSummary() - Concurrent Execution Timeout: ${e}.", 1, null, "warn")
@@ -1700,20 +1805,6 @@ private boolean checkThermostatSummary(thermostatIdsString) {
         // throw e
     } catch (Exception e) {
 		LOG("checkThermostatSummary() - General Exception: ${e}.", 1, null, "error")
- /*       atomicState.reAttemptPoll = atomicState.reAttemptPoll + 1
-        if (atomicState.reAttemptPoll > 3) {        
-        	apiLost("${preText}Too many retries (${atomicState.reAttemptPoll - 1}) for polling.")
-            return false
-        } else {
-        	LOG(preText+'Setting up retryPolling')
-			// def reAttemptPeriod = 15 // in sec
-        	if ( canSchedule() ) {
-            	runIn(atomicState.reAttemptInterval.toInteger(), "refreshAuthToken") 
-			} else { 
-            	LOG(preText+'Unable to schedule refreshAuthToken, running directly')
-            	refreshAuthToken() 
-            }
-        }  */ 
         result = false
         throw e
     }
@@ -1723,6 +1814,7 @@ private boolean checkThermostatSummary(thermostatIdsString) {
 }
 
 private def pollEcobeeAPI(thermostatIdsString = '') {
+	atomicState.pollEcobeeAPIStart = now()
 	boolean debugLevelFour = debugLevel(4)
     boolean debugLevelThree = debugLevel(3)
 	if (debugLevelFour) LOG("=====> pollEcobeeAPI() entered - thermostatIdsString = ${thermostatIdsString}", 4, null, "info")
@@ -1733,12 +1825,13 @@ private def pollEcobeeAPI(thermostatIdsString = '') {
     boolean runtimeUpdated = atomicState.runtimeUpdated
     boolean getWeather = atomicState.getWeather
     String preText = getDebugLevel() <= 2 ? '' : 'pollEcobeeAPI() - '
-	boolean somethingChanged = false
+	def somethingChanged = false
     String allMyChildren = getChildThermostatDeviceIdsString()
     String checkTherms = allMyChildren
 
 	// forcePoll = true
-	
+	somethingChanged = checkThermostatSummary(thermostatIdsString)
+    
 	if (forcePoll) {
     	// if it's a forcePoll, and thermostatIdString specified, we check only the specified thermostat, else we check them all
         if (thermostatIdsString) {
@@ -1817,12 +1910,12 @@ private def pollEcobeeAPI(thermostatIdsString = '') {
         tids = checkTherms.split(",")
         String names = ""
         tids.each { names = (names=="") ? getThermostatName(it) : names+", "+getThermostatName(it) }
-		LOG("${preText}Getting ${gw} for thermostat${checkTherms.contains(',')?'s':''} ${names} (${checkTherms})", 2, null, 'info')
+		LOG("${preText}Requesting ${gw} for thermostat${checkTherms.contains(',')?'s':''} ${names} (${checkTherms})", 2, null, 'info')
 	}
 	jsonRequestBody += '}}'   
 	if (debugLevelFour) LOG("pollEcobeeAPI() - jsonRequestBody is: ${jsonRequestBody}", 4, null, 'trace')
  
-    def result = false
+    // def result = false
 	
 	def pollParams = [
 			uri: apiEndpoint,
@@ -1830,254 +1923,316 @@ private def pollEcobeeAPI(thermostatIdsString = '') {
 			headers: ["Content-Type": "application/json", "Authorization": "Bearer ${atomicState.authToken}"],
 			query: [format: 'json', body: jsonRequestBody]
 	]
+	def pollState = [
+			debugLevelFour: 	debugLevelFour,
+        	debugLevelThree: 	debugLevelThree,
+        	forcePoll: 			forcePoll,
+        	thermostatUpdated: 	thermostatUpdated,
+        	alertsUpdated: 		alertsUpdated,
+        	runtimeUpdated: 	runtimeUpdated,
+        	getWeather: 		getWeather,
+        	somethingChanged: 	somethingChanged,
+			thermostatIdsString:thermostatIdsString,
+			jsonRequestBody:	jsonRequestBody,
+        	checkTherms:		checkTherms,
+	]
+    
+    atomicState.asyncPollStart = now()
+    asynchttp_v1.get( pollEcobeeAPICallback, pollParams, pollState ); 
+    atomicState.waitingForCallback = true
+    return true
+}
 
+def pollEcobeeAPICallback( resp, pollState ) {
+	def startMS = now()
+    atomicState.waitingForCallback = false
+    LOG("Poll callback (${startMS - atomicState.asyncPollStart}ms)",3,null,'info')
+	boolean debugLevelFour = 	pollState.debugLevelFour
+    boolean debugLevelThree = 	pollState.debugLevelThree
+	boolean forcePoll = 		pollState.forcePoll
+    boolean thermostatUpdated = pollState.thermostatUpdated
+    boolean alertsUpdated = 	pollState.alertsUpdated
+    boolean runtimeUpdated = 	pollState.runtimeUpdated
+    boolean getWeather = 		pollState.getWeather
+    String preText = getDebugLevel() <= 2 ? '' : 'pollEcobeeAPICallback() - '
+	def somethingChanged = 		pollState.somethingChanged
+	def thermostatIdsString = 	pollState.thermostatIdsString
+	def jsonRequestBody = 		pollState.jsonRequestBody
+    def checkTherms =			pollState.checkTherms
+	if (debugLevelFour) LOG("=====> pollEcobeeAPICallback() entered - thermostatIdsString = ${thermostatIdsString}", 4, null, "info")
+	
+	def result = true
 	def tidList = []
-	try{
-		httpGet(pollParams) { resp ->
-			if(resp.status == 200) {
-				if (resp.data) atomicState.thermostatData = resp.data		// this now only stores the most recent collection of changed data
+    LOG("pollEcobeeAPICallback() status code ${resp?.status}",4,null,'trace')
+    
+	if (resp && /* !resp.hasError() && */ (resp.status == 200)) {
+		try {
+			if (resp.json) {
+				atomicState.thermostatData = resp.json		// this only stores the most recent collection of changed data
 															// this may not be the entire set of data for all of our thermostats, so the rest 
                                                             // of this code will calculate updates from the individual data objects (which 
                                                             // always cache the latest values recieved)
-
-                // Update the atomicState caches for each received data object(s)
-                def tempSettings = [:]
-                def tempProgram = [:]
-                def tempEvents = [:]
-                def tempRuntime = [:]
-                def tempExtendedRuntime = [:]
-                def tempWeather = [:]
-                def tempSensors = [:]
-                def tempEquipStat = [:]
-                def tempLocation = [:]
-                // def tempOemCfg = [:]
-                def tempAlerts = [:]
-                
-                // collect the returned data into temporary individual caches (because we can't update individual Map items in an atomicState Map)	
-               	// if (resp && resp.containsKey(data) && resp.data.containsKey(thermostatList)) { // oddly, this occaisionally returns no thermostatList :(
-                if (resp && resp.data && resp.data.thermostatList) { // oddly, this occaisionally returns no thermostatList :(
-                	resp.data.thermostatList.each { stat ->
-                
-						String tid = stat.identifier.toString()
-                    	tidList += [tid]
-                        String tstatName = getThermostatName(tid)
-                    	if (debugLevelThree) LOG("pollEcobeeAPI() - Parsing data for thermostat ${tstatName} (${tid})", 3, null, 'info')
-                    
-						tempEquipStat[tid] = stat.equipmentStatus 			// always store ("" is a valid return value)
-                    
-                    	if (forcePoll || thermostatUpdated) {
-                        	if (stat.settings) tempSettings[tid] = stat.settings
-                        	if (stat.program) tempProgram[tid] = stat.program
-                        	if (stat.events) tempEvents[tid] = stat.events
-                        	if (stat.location) tempLocation[tid] = stat.location
-                        	// if (stat.oemCfg) tempOemCfg[tid] = stat.oemCfg
-                    	}
- 						if (forcePoll || runtimeUpdated) {
- 							if (stat.runtime) tempRuntime[tid] = stat.runtime
-                        	if (stat.extendedRuntime) tempExtendedRuntime[tid] = stat.extendedRuntime
-                        	if (stat.remoteSensors) tempSensors[tid] = stat.remoteSensors
-                        	// let's don't copy all that weather info if the timeStamp hasn't changed... 
-                        	if (stat.weather) {
-                            	def shortWeather = [timestamp: stat.weather.timestamp,
-                            						temperature: stat.weather.forecasts[0].temperature.toString(),
-                            						weatherSymbol: stat.weather.forecasts[0].weatherSymbol.toString()]
-                            	tempWeather[tid] = shortWeather
-                        	}
-                    	}
-                    	if (forcePoll || alertsUpdated) {
-                    		tempAlerts[tid] = stat.alerts
-                    	}
-                	}
-				} else {
-                	LOG('pollAPI() - poll: ${jsonRequestBody}; no thermostatList: ${resp}', 1, null, 'error')
-                }
-                
-                // OK, we have all the data received stored in their appropriate temporary cache, let's update the atomicState caches
-				if (tempEquipStat != [:]) {
-					if (atomicState.equipmentStatus) tempEquipStat = atomicState.equipmentStatus + tempEquipStat
-					atomicState.equipmentStatus = tempEquipStat
-				}
-                
-                if (forcePoll || thermostatUpdated) {
-                	if (tempProgram != [:]) {
-                   		if (atomicState.program) tempProgram = atomicState.program + tempProgram 
-                   		atomicState.program = tempProgram
-                	}
-                	if (tempEvents != [:]) {
-                   		if (atomicState.events) tempEvents = atomicState.events + tempEvents
-                   		atomicState.events = tempEvents
-                	}
-                    if (tempLocation != [:]) {
-                   		if (atomicState.statLocation) tempLocation = atomicState.statLocation + tempLocation
-                   		atomicState.statLocation = tempLocation
-                	}
-                    // if (tempOemCfg != [:]) {
-                   	// 	if (atomicState.oemCfg) tempOemCfg = atomicState.oemCfg + tempOemCfg
-                   	// 	atomicState.oemCfg = tempOemCfg
-                	// }
-                	if (tempSettings != [:]) {
-                   		if (atomicState.settings) tempSettings = atomicState.settings + tempSettings 
-                   		atomicState.settings = tempSettings
-                        // While we are here, let's find out if we really need the extendedRuntime data...
-						// We do it here because: a) it only changes when settings changes, and b) we already have the settings Map in hand
-                        // (thus it saves the cost of copying atomicState.settings later)
-                       	boolean needExtRT = false
-			       		tempSettings.each { 
-            				if (!needExtRT && checkTherms.contains(it.key)){
-            					switch (it.value.hvacMode) {
-            						case 'heat':
-                                    case 'auxHeatOnly':
-                     					if (it.value.hasHumidifier && (it.value.humidifierMode != 'off')) needExtRT = true 
-                        				break;
-                    				case 'cool':
-                    					if ((it.value.dehumidifierMode == 'on') && (it.value.hasDehumidifier || 
-                                                	(it.value.dehumidifyWithAC && (it.value.dehumidifyOvercoolOffset != 0)))) needExtRT = true 
-                        				break;
-                    				case 'auto':
-                        				if ((it.value.hasHumidifier && (it.value.humidifierMode != 'off')) || 
-                                        	(it.value.dehumidifierMode == 'on') && (it.value.hasDehumidifier || 
-                                                	(it.value.dehumidifyWithAC && (it.value.dehumidifyOvercoolOffset != 0)))) needExtRT = true
-                        				break;
-                				}	
-            				}
-        				}
-                        atomicState.needExtendedRuntime = needExtRT
-                    }                   
-                }
-                if (forcePoll || runtimeUpdated) {
-                    if (tempRuntime != [:]) {
-                    	if (atomicState.runtime) tempRuntime = atomicState.runtime + tempRuntime
-                    	atomicState.runtime = tempRuntime
-                    }
-                    if (tempExtendedRuntime != [:]) {
-                    	if (atomicState.extendedRuntime) tempExtendedRuntime = atomicState.extendedRuntime + tempExtendedRuntime
-                    	atomicState.extendedRuntime = tempExtendedRuntime
-                    }
-                    if (tempSensors != [:]) {
-                    	if (atomicState.remoteSensors) tempSensors = atomicState.remoteSensors + tempSensors 
-                    	atomicState.remoteSensors = tempSensors
-                    }
-                    
-                    if (tempWeather != [:]) {
-                    	if (atomicState.weather) tempWeather = atomicState.weather + tempWeather 
-                    	atomicState.weather = tempWeather
-                    }
-				}
-                if (forcePoll || alertsUpdated) {
-                	if (tempAlerts != [:]) {
-                    	if (atomicState.alerts) tempAlerts = atomicState.alerts + tempAlerts
-                        atomicState.alerts = tempAlerts
-                    }
-                }
-                
-                // OK, Everything is safely stored, let's get to parsing the objects and finding the actual changed data
-                updateLastPoll()
-                if (debugLevelThree) LOG('pollEcobeeAPI() - Parsing complete', 3, null, 'info')
-
-                // Update the data and send it down to the devices as events
-                if (settings.thermostats) updateThermostatData()  	// update thermostats first (some sensor data is dependent upon thermostat changes)
-				if (settings.ecobeesensors) updateSensorData()		// Only update configured sensors (and then only if they have changes)
-                // if (forcePoll || alertsUpdated) /*updateAlertsData() */ runIn(20, "updateAlertsData", [overwrite: true])	// Update alerts asynchronously
-                
-                // pollChildren() will actually send all the events we just created, once we return
-				// just a bit more housekeeping...
-				result = true
-                atomicState.lastRevisions = atomicState.latestRevisions		// copy the Map
-               	if (forcePoll) atomicState.forcePoll = false				// it's ok to clear the flag now
-                if (runtimeUpdated) atomicState.runtimeUpdated = false
-                // if (thermostatUpdated) { atomicState.thermostatUpdated = false }
-                def needPrograms = atomicState.needPrograms
-                atomicState.thermostatUpdated = thermostatUpdated ? false : needPrograms
-                if (!thermostatUpdated && needPrograms) LOG("Need settings, programs & events next time", 2, null, 'info')
-                if (runtimeUpdated && getWeather) atomicState.getWeather = false
-                if (alertsUpdated) atomicState.alertsUpdated = false
-                
-                // Tell the children that we are once again connected to the Ecobee API Cloud
-                if (apiConnected() != "full") {
-					apiRestored()
-                    generateEventLocalParams() // Update the connection status
-                }
-                
-                String names = resp.data.thermostatList?.name.toString().replaceAll("\\[","").replaceAll("\\]","")
-                String tids = ""
-                def numStats = 0
-                tidList.each { numStats++; tids = (tids=="") ? it : tids+","+it }
-                if (preText == '') {	// avoid calling debugLevel() again) {
-					LOG("Updated thermostat${(numStats>1)?'s':''} ${names} (${tids})", 2, null, 'info')
-                } else {
-                	if (debugLevelFour) LOG("pollEcobeeAPI() - Updated thermostat${(numStats>1)?'s':''} ${names} (${tidList}) ${atomicState.thermostats}", 4, null, 'info')
-				}
 			} else {
-				LOG("${preText}Polling children & got http status ${resp.status}", 1, null, "error")
+            	// FAIL - no data
+                LOG('pollEcobeeAPICallback() - poll - no JSON: ${resp.data}', 1, null, 'error')
+                result = false
+            }
+		} catch (Exception e) {
+			LOG("pollEcobeeAPICallback() - General Exception: ${e}", 1, null, "error")
+        	atomicState.reAttemptPoll = atomicState.reAttemptPoll + 1
+        	if (atomicState.reAttemptPoll > 3) {        
+        		apiLost("${preText}Too many retries (${atomicState.reAttemptPoll - 1}) for polling.")
+        	} else {
+        		LOG(preText+'Setting up retryPolling',1,null,'debug')
+            	runIn(atomicState.reAttemptInterval.toInteger(), "pollChildren", [overwrite: true]) 
+        	}
+        	throw e
+            return false
+        } 
+        
+        if (atomicState.reAttemptPoll > 0) apiRestored()
+        	
+        // Update the atomicState caches for each received data object(s)
+        def tempSettings = [:]
+		def tempProgram = [:]
+		def tempEvents = [:]
+		def tempRuntime = [:]
+		def tempExtendedRuntime = [:]
+		def tempWeather = [:]
+		def tempSensors = [:]
+		def tempEquipStat = [:]
+		def tempLocation = [:]
+		// def tempOemCfg = [:]
+		def tempAlerts = [:]
 
-				//refresh the auth token
-				if (resp.status == 500 && resp.data.status.code == 14) {
-					LOG("${preText}Resp.status: ${resp.status} Status Code: ${resp.data.status.code}. Unable to recover", 1, null, "error")
-                    // Should not be possible to recover from a code 14 but try anyway?
-                    apiLost("pollEcobeeAPI() - Resp.status: ${resp.status} Status Code: ${resp.data.status.code}. Unable to recover.")
+		// collect the returned data into temporary individual caches (because we can't update individual Map items in an atomicState Map)	
+        // if (resp && resp.containsKey(data) && resp.data.containsKey(thermostatList)) { // oddly, this occaisionally returns no thermostatList :(
+        if (result && resp.json.thermostatList) { // oddly, this sometimes returns no thermostatList :(
+        	resp.json.thermostatList.each { stat ->
+                String tid = stat.identifier.toString()
+				tidList += [tid]
+				String tstatName = getThermostatName(tid)
+				if (debugLevelThree) LOG("Parsing data for thermostat ${tstatName} (${tid})", 3, null, 'info')
+				tempEquipStat[tid] = stat.equipmentStatus 			// always store ("" is a valid return value)                    
+                    	
+				if (forcePoll || thermostatUpdated) {
+					if (stat.settings) 	tempSettings[tid] = stat.settings
+					if (stat.program) 	tempProgram[tid] = 	stat.program
+					if (stat.events) 	tempEvents[tid] = 	stat.events
+					if (stat.location) 	tempLocation[tid] = stat.location
+					// if (stat.oemCfg) tempOemCfg[tid] = 	stat.oemCfg
+				} 
+				
+				if (forcePoll || runtimeUpdated) {
+					if (stat.runtime) 			tempRuntime[tid] = 			stat.runtime
+					if (stat.extendedRuntime) 	tempExtendedRuntime[tid] = 	stat.extendedRuntime
+					if (stat.remoteSensors) 	tempSensors[tid] = 			stat.remoteSensors
+					// let's don't copy all that weather info...we only need some 3 bits of that info
+					if (stat.weather) {
+						def shortWeather = [timestamp: 		stat.weather.timestamp,
+											temperature: 	stat.weather.forecasts[0]?.temperature.toString(),
+                                            humidity: 		stat.weather.forecasts[0]?.relativeHumidity,
+                                            dewpoint:		stat.weather.forecasts[0]?.dewpoint,
+                                            pressure:		stat.weather.forecasts[0]?.pressure,
+											weatherSymbol: 	stat.weather.forecasts[0]?.weatherSymbol.toString()]
+						tempWeather[tid] = shortWeather
+					}
 				}
-				else {
-					LOG("pollEcobeeAPI() - Unexpected response Resp.status: ${resp.status} Status Code: ${resp.data.status.code}.", 1, null, "error")
+				
+				if (forcePoll || alertsUpdated) {
+					tempAlerts[tid] = stat.alerts
 				}
+			}
+		} else {
+			LOG('pollEcobeeAPICallback() - poll: ${jsonRequestBody}; no thermostatList: ${resp.json}', 1, null, 'error')
+            result = false
+        }
+                
+        // OK, we have all the data received stored in their appropriate temporary cache, let's update the atomicState caches
+        // ** Equipment Status **
+		if (result && (tempEquipStat != [:])) {
+			if (atomicState.equipmentStatus) tempEquipStat = atomicState.equipmentStatus + tempEquipStat
+			atomicState.equipmentStatus = tempEquipStat
+		}
+        
+        // ** Thermostat Status (Program, Events, Location) **
+		if (result && (forcePoll || thermostatUpdated)) {
+			if (tempProgram != [:]) {
+				if (atomicState.program) tempProgram = atomicState.program + tempProgram 
+				atomicState.program = tempProgram
+			}
+			if (tempEvents != [:]) {
+				if (atomicState.events) tempEvents = atomicState.events + tempEvents
+				atomicState.events = tempEvents
+			}
+			if (tempLocation != [:]) {
+				if (atomicState.statLocation) tempLocation = atomicState.statLocation + tempLocation
+				atomicState.statLocation = tempLocation
+			}
+			// if (tempOemCfg != [:]) {
+			// 	if (atomicState.oemCfg) tempOemCfg = atomicState.oemCfg + tempOemCfg
+			// 	atomicState.oemCfg = tempOemCfg
+			// }
+			boolean needExtRT = false
+			if (tempSettings != [:]) {
+				if (atomicState.settings) tempSettings = atomicState.settings + tempSettings 
+				atomicState.settings = tempSettings
+				// While we are here, let's find out if we really need the extendedRuntime data...
+				// We do it here because: a) it only changes when settings changes, and b) we already have the settings Map in hand
+				// (thus it saves the cost of copying atomicState.settings later
+				tempSettings.each { 
+					if (!needExtRT && checkTherms.contains(it.key)) {
+						switch (it.value.hvacMode) {
+							case 'heat':
+							case 'auxHeatOnly':
+								if (it.value.hasHumidifier && (it.value.humidifierMode != 'off')) needExtRT = true
+								break;
+                    		case 'cool':
+                    			if ((it.value.dehumidifierMode == 'on') && (it.value.hasDehumidifier || 
+																			(it.value.dehumidifyWithAC && 
+																			 (it.value.dehumidifyOvercoolOffset != 0)))) needExtRT = true 
+                        		break;
+                    		case 'auto':
+                        		if ((it.value.hasHumidifier && (it.value.humidifierMode != 'off')) || 
+									(it.value.dehumidifierMode == 'on') && (it.value.hasDehumidifier || 
+																			(it.value.dehumidifyWithAC && 
+																			 (it.value.dehumidifyOvercoolOffset != 0)))) needExtRT = true
+                        		break;
+                		}
+					}
+				} 
+			}
+			atomicState.needExtendedRuntime = needExtRT
+		}
+		
+        // ** runtime Status (runtime, extended runtime, sensors, weather) **
+		if (result && (forcePoll || runtimeUpdated)) {
+			if (tempRuntime != [:]) {
+				if (atomicState.runtime) tempRuntime = atomicState.runtime + tempRuntime
+				atomicState.runtime = tempRuntime
+			}
+			if (tempExtendedRuntime != [:]) {
+				if (atomicState.extendedRuntime) tempExtendedRuntime = atomicState.extendedRuntime + tempExtendedRuntime
+				atomicState.extendedRuntime = tempExtendedRuntime
+			}
+			if (tempSensors != [:]) {
+				if (atomicState.remoteSensors) tempSensors = atomicState.remoteSensors + tempSensors 
+				atomicState.remoteSensors = tempSensors
+			}
+			if (tempWeather != [:]) {
+				if (atomicState.weather) tempWeather = atomicState.weather + tempWeather 
+				atomicState.weather = tempWeather
+			}
+		}
+		
+        // ** Alerts Status **
+		if (result && (forcePoll || alertsUpdated)) {
+			if (tempAlerts != [:]) {
+				if (atomicState.alerts) tempAlerts = atomicState.alerts + tempAlerts
+				atomicState.alerts = tempAlerts
+			}
+		}
+		
+		// OK, Everything is safely stored, let's get to parsing the objects and finding the actual changed data
+		if (result) {
+			updateLastPoll()
+			if (debugLevelThree) LOG('Parsing complete', 3, null, 'info')
+			
+			// Update the data and send it down to the devices as events
+			if (settings.thermostats) updateThermostatData()  	// update thermostats first (some sensor data is dependent upon thermostat changes)
+			if (settings.ecobeesensors) updateSensorData()		// Only update configured sensors (and then only if they have changes)
+			// if (forcePoll || alertsUpdated) /*updateAlertsData() */ runIn(20, "updateAlertsData", [overwrite: true])	// Update alerts asynchronously
+			
+			// pollChildren() will actually send all the events we just created, once we return
+			// just a bit more housekeeping...
+			result = true
+			atomicState.lastRevisions = atomicState.latestRevisions		// copy the Map
+			if (forcePoll) atomicState.forcePoll = false				// it's ok to clear the flag now
+			if (runtimeUpdated) atomicState.runtimeUpdated = false
+			// if (thermostatUpdated) { atomicState.thermostatUpdated = false }
+			def needPrograms = atomicState.needPrograms
+			atomicState.thermostatUpdated = thermostatUpdated ? false : needPrograms
+			if (!thermostatUpdated && needPrograms) LOG("Need settings, programs & events next time", 2, null, 'info')
+			if (runtimeUpdated && getWeather) atomicState.getWeather = false
+			if (alertsUpdated) atomicState.alertsUpdated = false
+			
+			// Tell the children that we are once again connected to the Ecobee API Cloud
+			if (apiConnected() != "full") {
+				apiRestored()
+				generateEventLocalParams() // Update the connection status
+			}
+			
+			String names = resp.json.thermostatList?.name.toString().replaceAll("\\[","").replaceAll("\\]","")
+			String tids = ""
+			def numStats = 0
+			tidList.each { numStats++; tids = (tids=="") ? it : tids+","+it }
+			if (preText == '') {	// avoid calling debugLevel() again) {
+				LOG("Polling thermostat${(numStats>1)?'s':''} ${names} (${tids}) completed", 2, null, 'info')
+			} else {
+				if (debugLevelFour) LOG("pollEcobeeAPICallback() - Updated thermostat${(numStats>1)?'s':''} ${names} (${tidList}) ${atomicState.thermostats}", 4, null, 'info')
 			}
 		}
         atomicState.inTimeoutRetry = 0	// Not in Timeout Recovery any longer
-	} catch (groovyx.net.http.HttpResponseException e) {  
-    	result = false  // this thread failed
-    	if ((e.statusCode == 500) && (e.response.data.status.code == 14)) {
-           	if (debugLevelThree) LOG("pollEcobeAPI() - Auth_token has expired", 3, null, "warn")
-           	atomicState.action = "pollChildren"
-            if (debugLevelFour) LOG( "pollEcobeeAPI() - Refreshing your auth_token!", 4, null, 'info')
-            if ( refreshAuthToken() ) { 
-            	// Note that refreshAuthToken will reschedule pollChildren if it succeeds in refreshing the token...
-                LOG( 'pollEcobeeAPI() - Auth_token refreshed', 2, null, 'info')
-                //runIn(atomicState.reAttemptInterval.toInteger(), "pollChildren", [overwrite: true])
-            } else {
-                LOG( 'pollEcobeeApi() _ Auth_token refresh failed', 1, null, 'error')
+	} else if (resp && resp.hasError()) {
+    	result = false
+		if (debugLevelFour) LOG("${preText}Poll returned http status ${resp.status}, ${resp.errorMessage}", 4, null, "error")
+        
+		// Handle recoverable / retryable errors
+		if (resp.status == 500) {
+  			// Ecobee server error
+        	if (resp.errorJson?.status.code == 14) {
+            	// Auth_token expired
+            	if (debugLevelThree) LOG("Polling: Auth_token expired", 3, null, "warn")
+                atomicState.action = "pollChildren"
+                if ( refreshAuthToken() ) { 
+                    // Note that refreshAuthToken will reschedule pollChildren if it succeeds in refreshing the token...
+                    LOG( 'Polling: Auth_token refreshed', 2, null, 'info')
+                } else {
+                    LOG( 'Polling: Auth_token refresh failed', 1, null, 'error')
+                }
+            	atomicState.inTimeoutRetry = 0
+            	return result
+            } else { 
+            	// All other Ecobee Server (500) errors here
+            	LOG("Ecobee Server error ${rest.errorJson?.status.code}: ${resp.errorJson?.status.message}", 1, null, 'error')
+                // Don't retry for now...may change in the future
+                return result
             }
-            atomicState.inTimeoutRetry = 0
-        } else {
-        	LOG("pollEcobeeAPI() - HttpResponseException: ${e} StatusCode: ${e.statusCode} response.data.status.code: ${e.response.data.status.code}", 1, null, "error")
-        }
-    } catch (java.util.concurrent.TimeoutException e) {
-    	LOG("pollEcobeeAPI() - Concurrent TimeoutException: ${e}.", 1, null, "warn")
-        // Do not add an else statement to run immediately as this could cause an long looping cycle if the API is offline
-        runIn(atomicState.reAttemptInterval.toInteger(), "pollChildren", [overwrite: true]) 
-        result = false
-    } catch (org.apache.http.conn.ConnectTimeoutException | org.apache.http.conn.HttpHostConnectException | javax.net.ssl.SSLPeerUnverifiedException | javax.net.ssl.SSLHandshakeException | java.net.SocketTimeoutException e) {
-    	LOG("pollEcobeeAPI() - ${e}.",1,null,'warn') 	// Just log it, and hope for better next time...
-        if (apiConnected != 'warn') {
-        	atomicState.connected = 'warn'
-        	atomicState.lastPoll = now()
-        	atomicState.lastPollDate = getTimestamp()
-			generateEventLocalParams()
-        }
-        def inTimeoutRetry = atomicState.inTimeoutRetry
-        if (inTimeoutRetry == null) inTimeoutRetry = 0
-        if (inTimeoutRetry < 3) runIn(atomicState.reAttemptInterval.toInteger(), "pollChildren", [overwrite: true])
-        atomicState.inTimeoutRetry = inTimeoutRetry + 1
-        result = false
-        // throw e
-    } catch (Exception e) {
-		LOG("pollEcobeAPI() - General Exception: ${e}.", 1, null, "error")
-        atomicState.reAttemptPoll = atomicState.reAttemptPoll + 1
-        if (atomicState.reAttemptPoll > 3) {        
-        	apiLost("${preText}Too many retries (${atomicState.reAttemptPoll - 1}) for polling.")
-            result = false
-        } else {
-        	LOG(preText+'Setting up retryPolling')
-			// def reAttemptPeriod = 15 // in sec
-        	if ( canSchedule() ) {
-            	runIn(atomicState.reAttemptInterval.toInteger(), "refreshAuthToken", [overwrite: true]) 
-			} else { 
-            	LOG(preText+'Unable to schedule refreshAuthToken, running directly', 4, null, 'trace')
-            	refreshAuthToken() 
-            }
-        }
-        result = false
-        throw e
-    }
-    if (debugLevelFour) LOG("<===== Leaving pollEcobeeAPI() results: ${result}", 4, null, 'trace')
+		} else if (((resp.status > 400) && (resp.status < 405)) || (resp.status == 408) || ((resp.status > 500) && (resp.status < 505))) {
+        	// Retry on transient, recoverable error codes (timeouts, server temporarily unavailable, etc.) see https://en.wikipedia.org/wiki/List_of_HTTP_status_codes 
+            LOG("Polling error: ${resp.status}, ${resp.errorMessage} - Will Retry",1,null,'warn') 	// Just log it, and hope for better next time...
+        	if (apiConnected != 'warn') {
+        		atomicState.connected = 'warn'
+        		atomicState.lastPoll = now()
+        		atomicState.lastPollDate = getTimestamp()
+				generateEventLocalParams()
+        	}
+        	def inTimeoutRetry = atomicState.inTimeoutRetry
+        	if (inTimeoutRetry == null) inTimeoutRetry = 0
+        	if (inTimeoutRetry < 3) runIn(atomicState.reAttemptInterval.toInteger(), "pollChildren", [overwrite: true])
+        	atomicState.inTimeoutRetry = inTimeoutRetry + 1
+        	return result
+        } else /* can we handle any other errors??? */ {
+			LOG("Polling Error ${resp.status}: ${resp.errorMessage}, ${resp.errorJson?.status.message}, ${resp.errorJson?.status.code}", 1, null, "error")
+		}
+        // For now, the code here just logs the error and assumes that checkThermostatSummary() will recover from the unhandled errors on the next call.
+        return result
+	}
+	
+	// Now we have to actually send the updates
+	if (result) {
+		def polledMS = now()
+		def prepTime = (polledMS-startMS)			// if prep takes too long, we will do the updates asynchronously too
+		if (debugLevelThree) LOG("Prep complete (${prepTime}ms)",3,null,'trace')
+		if (alertsUpdated) {
+			if (prepTime > 11000) { runIn(2, 'generateAlertsAndEvents', [overwrite: true]) } else { generateAlertsAndEvents() }
+		} else {
+			if (prepTime > 11000) { runIn(2, 'generateTheEvents', [overwrite: true]) } else { generateTheEvents() }
+		}
+	} else {
+		LOG('pollEcobeeAPICallback() Error',1,null,'warn')
+	}
+    if (debugLevelFour) LOG("<===== Leaving pollEcobeeAPICallback() results: ${result}", 4, null, 'trace')
 	return result
 }
 
@@ -2332,16 +2487,16 @@ def updateSensorData() {
 			if (debugLevelFour) LOG("updateSensorData() - Sensor ${it?.name}, sensorDNI == ${sensorDNI}", 4)
             	              
             if (sensorDNI && settings.ecobeesensors?.contains(sensorDNI)) {		// only process the selected/configured sensors
-				def temperature = ''
-				def occupancy = ''
+				def temperature
+				def occupancy
                 Integer humidity = null
                             
 				it.capability.each { cap ->
 					if (cap.type == 'temperature') {
                    		if (debugLevelFour) LOG("updateSensorData() - Sensor ${it.name} temp is ${cap.value}", 4)
                        	if ( cap.value.isNumber() ) { // Handles the case when the sensor is offline, which would return "unknown"
-							temperature = cap.value as Double
-							temperature = (temperature / 10).toDouble()  //.round(precision) // wantMetric() ? (temperature / 10).toDouble().round(1) : (temperature / 10).toDouble().round(1)
+							temperature = roundIt((cap.value.toBigDecimal() / 10.0), precision)
+							//temperature = roundIt((temperature / 10.0), precision)  //.round(precision) // wantMetric() ? (temperature / 10).toDouble().round(1) : (temperature / 10).toDouble().round(1)
                        	} else if (cap.value == 'unknown') {
                        		// TODO: Do something here to mark the sensor as offline?
                             if (isConnected) {
@@ -2450,7 +2605,7 @@ def updateSensorData() {
     if (preText=='') {
     	def sz = sNames.size()
 		if (sz > 1) sNames.sort()
-        LOG("Device data updated for ${sz} sensor${sz!=1?'s':''}${sNames?' '+sNames:''}",2, null, 'info')
+        LOG("Updates for ${sz} sensor${sz!=1?'s':''}${sNames?' ('+sNames.toString()[1..-2]+')':''}",2, null, 'info')
     } else {
 		if (debugLevelFour) LOG("updateSensorData() - Updated these remoteSensors: ${sensorCollector}", 4, null, 'trace') 
     }
@@ -2504,10 +2659,13 @@ def updateThermostatData() {
         
     // Handle things that only change when runtime object is updated)
         def occupancy = 'not supported'
-        Double tempTemperature
-        Double tempHeatingSetpoint = 0.0
-        Double tempCoolingSetpoint = 999.0
+        def tempTemperature
+        def tempHeatingSetpoint = 0.0
+        def tempCoolingSetpoint = 999.0
         def tempWeatherTemperature
+        def tempWeatherDewpoint
+        def tempWeatherHumidity
+        def tempWeatherPressure
         
         if (forcePoll || runtimeUpdated) {
 			// Occupancy (motion)
@@ -2538,12 +2696,19 @@ def updateThermostatData() {
             // NOTE: The thermostat always present Fahrenheit temps with 1 digit of decimal precision. We want to maintain that precision for inside temperature so that apps like vents and Smart Circulation
             // 		 can operate efficiently. So, while the user can specify a display precision of 0, 1 or 2 decimal digits, we ALWAYS keep and send max decimal digits and let the device handler adjust for display
             //		 For Fahrenheit, we keep the 1 decimal digit the API provides, for Celsius we allow for 2 decimal digits as a result of the mathematical calculation       
-			tempTemperature = myConvertTemperatureIfNeeded( (runtime.actualTemperature.toDouble() / 10.0), 'F', apiPrecision)
-        	tempHeatingSetpoint = myConvertTemperatureIfNeeded( (runtime.desiredHeat.toDouble() / 10.0), 'F', apiPrecision)
-        	tempCoolingSetpoint = myConvertTemperatureIfNeeded( (runtime.desiredCool.toDouble() / 10.0), 'F', apiPrecision)
-        	if (atomicState.weather && atomicState.weather?.containsKey(tid) && atomicState.weather[tid].containsKey('temperature')) {
-            	tempWeatherTemperature = myConvertTemperatureIfNeeded( ((atomicState.weather[tid].temperature.toDouble() / 10.0)), "F", apiPrecision)
+			tempTemperature = myConvertTemperatureIfNeeded( (runtime.actualTemperature.toBigDecimal() / 10.0), 'F', apiPrecision)
+        	tempHeatingSetpoint = myConvertTemperatureIfNeeded( (runtime.desiredHeat / 10.0), 'F', apiPrecision)
+        	tempCoolingSetpoint = myConvertTemperatureIfNeeded( (runtime.desiredCool / 10.0), 'F', apiPrecision)
+        	//if (atomicState.weather && atomicState.weather?.containsKey(tid) && atomicState.weather[tid].containsKey('temperature')) {
+            // log.debug atomicState.weather[tid]
+            def weather = atomicState.weather
+            // log.debug weather
+            if (weather[tid]?.temperature?.isNumber()) {
+            	tempWeatherTemperature = myConvertTemperatureIfNeeded( ((weather[tid].temperature.toBigDecimal() / 10.0)), "F", apiPrecision)
         	} else {tempWeatherTemperature = 451.0} // will happen only once, when weather object changes to shortWeather
+            if (weather[tid]?.dewpoint?.isNumber()) tempWeatherDewpoint = myConvertTemperatureIfNeeded( ((weather[tid].dewpoint / 10.0)), "F", apiPrecision)
+            if (weather[tid]?.humidity?.isNumber()) tempWeatherHumidity = weather[tid].humidity
+            if (weather[tid]?.pressure?.isNumber()) tempWeatherPressure = usingMetric ? weather[tid].pressure : roundIt((weather[tid].pressure * 0.02953),2) //milliBars to inHg
         }
      
      // EQUIPMENT SPECIFICS
@@ -2560,26 +2725,26 @@ def updateThermostatData() {
 		def coolLow
 		def heatRange
 		def coolRange
-		Double tempHeatDiff = 0.0
-        Double tempCoolDiff = 0.0
-        Double tempHeatCoolMinDelta = 1.0
+		def tempHeatDiff = 0.0
+        def tempCoolDiff = 0.0
+        def tempHeatCoolMinDelta = 1.0
 
 		if (forcePoll || thermostatUpdated) {
-            tempHeatDiff = usingMetric ? (statSettings.stage1HeatingDifferentialTemp.toDouble() / 1.8).toDouble().round(0) / 10.0 : statSettings.stage1HeatingDifferentialTemp.toDouble() / 10.0
-            tempCoolDiff = usingMetric ? (statSettings.stage1CoolingDifferentialTemp.toDouble() / 1.8).toDouble().round(0) / 10.0 : statSettings.stage1CoolingDifferentialTemp.toDouble() / 10.0
-            tempHeatCoolMinDelta = usingMetric ? (statSettings.heatCoolMinDelta.toDouble() / 1.8).toDouble().round(0) / 10.0 : statSettings.heatCoolMinDelta.toDouble() / 10.0
+            tempHeatDiff = usingMetric ? roundIt((statSettings.stage1HeatingDifferentialTemp / 1.8), 0) / 10.0 : statSettings.stage1HeatingDifferentialTemp / 10.0
+            tempCoolDiff = usingMetric ? roundIt((statSettings.stage1CoolingDifferentialTemp / 1.8), 0) / 10.0 : statSettings.stage1CoolingDifferentialTemp / 10.0
+            tempHeatCoolMinDelta = usingMetric ? roundIt((statSettings.heatCoolMinDelta / 1.8), 0) / 10.0 : statSettings.heatCoolMinDelta / 10.0
             
 			// RANGES
 			// UI works better with the same ranges for both heat and cool...
 			// but the device handler isn't using these values for the UI right now (can't dynamically define the range)			
-			heatHigh = myConvertTemperatureIfNeeded((statSettings.heatRangeHigh.toDouble() / 10.0), 'F', 1)
-			heatLow =  myConvertTemperatureIfNeeded((statSettings.heatRangeLow.toDouble()  / 10.0), 'F', 1)
-			coolHigh = myConvertTemperatureIfNeeded((statSettings.coolRangeHigh.toDouble() / 10.0), 'F', 1)
-			coolLow =  myConvertTemperatureIfNeeded((statSettings.coolRangeLow.toDouble()  / 10.0), 'F', 1)
+			heatHigh = myConvertTemperatureIfNeeded((statSettings.heatRangeHigh / 10.0), 'F', 1)
+			heatLow =  myConvertTemperatureIfNeeded((statSettings.heatRangeLow  / 10.0), 'F', 1)
+			coolHigh = myConvertTemperatureIfNeeded((statSettings.coolRangeHigh / 10.0), 'F', 1)
+			coolLow =  myConvertTemperatureIfNeeded((statSettings.coolRangeLow  / 10.0), 'F', 1)
 			
 			// calculate these anyway (for now) - it's easier to read the range while debugging
-			heatRange = (heatLow && heatHigh) ? "(${Math.round(heatLow)}..${Math.round(heatHigh)})" : (usingMetric ? '(5..35)' : '(45..95)')
-			coolRange = (coolLow && coolHigh) ? "(${Math.round(coolLow)}..${Math.round(coolHigh)})" : (usingMetric ? '(5..35)' : '(45..95)')
+			heatRange = (heatLow && heatHigh) ? "(${roundIt(heatLow,0)}..${roundIt(heatHigh,0)})" : (usingMetric ? '(5..35)' : '(45..95)')
+			coolRange = (coolLow && coolHigh) ? "(${roundIt(coolLow,0)}..${roundIt(coolHigh,0)})" : (usingMetric ? '(5..35)' : '(45..95)')
 		}
  
 	// handle things that depend on both thermostat and runtime objects
@@ -2735,11 +2900,11 @@ def updateThermostatData() {
                     break;
                 case 'autoAway':
              		currentClimateName = 'Auto Away'
-                    currentClimate = 'away'
+                    currentClimate = 'Away'
                 	break;
                 case 'autoHome':
                		currentClimateName = 'Auto Home'
-                    currentClimate = 'home'
+                    currentClimate = 'Home'
                     break;
             	default:                
                		currentClimateName = runningEvent.type
@@ -2813,8 +2978,8 @@ def updateThermostatData() {
         	isHeating = true
             if (!forcePoll && !runtimeUpdated) {
             	// these weren't calculated above, so we do them here
-            	tempTemperature = myConvertTemperatureIfNeeded( (runtime.actualTemperature.toDouble() / 10.0), "F", apiPrecision)
-        		tempHeatingSetpoint = myConvertTemperatureIfNeeded( (runtime.desiredHeat.toDouble() / 10.0), 'F', apiPrecision)
+            	tempTemperature = myConvertTemperatureIfNeeded( (runtime.actualTemperature / 10.0), "F", apiPrecision)
+        		tempHeatingSetpoint = myConvertTemperatureIfNeeded( (runtime.desiredHeat / 10.0), 'F', apiPrecision)
             }
             if ((statSettings?.disablePreHeating == false) && (tempTemperature > (tempHeatingSetpoint /* + 0.1 */))) {
             	smartRecovery = true
@@ -2825,13 +2990,13 @@ def updateThermostatData() {
         	isCooling = true
             if (!forcePoll && !runtimeUpdated) {
             	// these weren't calculated above, so we do them here
-            	tempTemperature = myConvertTemperatureIfNeeded( (runtime.actualTemperature.toDouble() / 10.0), "F", apiPrecision)
-                tempCoolingSetpoint = myConvertTemperatureIfNeeded( (runtime.desiredCool.toDouble() / 10.0), 'F', apiPrecision)
+            	tempTemperature = myConvertTemperatureIfNeeded( (runtime.actualTemperature / 10.0), "F", apiPrecision)
+                tempCoolingSetpoint = myConvertTemperatureIfNeeded( (runtime.desiredCool / 10.0), 'F', apiPrecision)
             }
             // Check if humidity > humidity setPoint, and tempTemperature > (coolingSetpoint - 0.1)
             if (hasDehumidifier) {
             	if (runtime.actualHumidity > dehumiditySetpoint) {
-                	if ((tempTemperature < tempCoolingSetpoint) && (tempTemperature >= (tempCoolingSetpoint - (statSettings?.dehumidifyOvercoolOffset?.toDouble()/10.0)))) {
+                	if ((tempTemperature < tempCoolingSetpoint) && (tempTemperature >= (tempCoolingSetpoint - (statSettings?.dehumidifyOvercoolOffset?.toBigDecimal() / 10.0)))) {
                     	overCool = true
                         LOG("${tstatName} is Over Cooling (${tid}), temp: ${tempTemperature}, setpoint: ${tempCoolingSetpoint}",3,null,'info')
                     } else {
@@ -2963,8 +3128,9 @@ def updateThermostatData() {
         	
             // Thermostat configuration stuff that almost never changes - if any one changes, send them all
         	def neverList = [statMode,autoMode,statHoldAction,coolStages,heatStages,/*heatHigh,heatLow,coolHigh,coolLow,*/heatRange,coolRange,climatesList,
-        						hasHeatPump,hasForcedAir,hasElectric,hasBoiler,auxHeatMode,hasHumidifier,humidifierMode,humidtySetpoint,hasDehumidifier,dehumidifierMode,dehumidifyOvercoolOffset,
-                                dehumiditySetpoint,tempHeatDiff,tempCoolDiff,tempHeatCoolMinDelta] 
+        						hasHeatPump,hasForcedAir,hasElectric,hasBoiler,auxHeatMode,hasHumidifier,hasDehumidifier,dehumidifyOvercoolOffset,
+                                /*humidifierMode,humidtySetpoint,*//*dehumidifierMode,dehumiditySetpoint,*/
+                                tempHeatDiff,tempCoolDiff,tempHeatCoolMinDelta] 
  			if (forcePoll || (changeNever == [:]) || !changeNever.containsKey(tid) || (changeNever[tid] != neverList)) {  
             	data += [
 					coolMode: (coolStages > 0),
@@ -2984,18 +3150,13 @@ def updateThermostatData() {
                 	hasHeatPump: hasHeatPump,
             		hasForcedAir: hasForcedAir,
             		hasElectric: hasElectric,
-            		hasBoiler: hasBoiler,
-					auxHeatMode: auxHeatMode,
+            		hasBoiler: hasBoiler,                    
             		hasHumidifier: hasHumidifier,
-                    humiditySetpoint: humiditySetpoint,
-                    humidifierMode: humidifierMode,
-					hasDehumidifier: hasDehumidifier,
-                    dehumidifierMode: dehumidifierMode,
-                    dehumiditySetpoint: dehumiditySetpoint,
+					hasDehumidifier: hasDehumidifier,                    
                     dehumidifyOvercoolOffset: dehumidifyOvercoolOffset,
-                	heatDifferential: String.format("%.${apiPrecision}f", tempHeatDiff.toDouble().round(apiPrecision)),
-                	coolDifferential: String.format("%.${apiPrecision}f", tempCoolDiff.toDouble().round(apiPrecision)),
-                    heatCoolMinDelta: String.format("%.${apiPrecision}f", tempHeatCoolMinDelta.toDouble().round(apiPrecision)),
+                	heatDifferential: String.format("%.${apiPrecision}f", roundIt(tempHeatDiff, apiPrecision)),
+                	coolDifferential: String.format("%.${apiPrecision}f", roundIt(tempCoolDiff, apiPrecision)),
+                    heatCoolMinDelta: String.format("%.${apiPrecision}f", roundIt(tempHeatCoolMinDelta, apiPrecision)),
             	]
             	changeNever[tid] = neverList
             	atomicState.changeNever = changeNever
@@ -3014,8 +3175,8 @@ def updateThermostatData() {
                     }
                 }
             }
-         	def rarelyList = [fanMinOnTime,isConnected,thermostatHold,holdEndsAt,statusMsg,currentClimate,currentClimateName,currentClimateId,scheduledClimateName,
-            					scheduledClimateId,currentFanMode]
+         	def rarelyList = [fanMinOnTime,isConnected,thermostatHold,holdEndsAt,statusMsg,humiditySetpoint,humidifierMode,dehumidifierSetpoint,dehumiditySetpoint,
+            					currentClimate,currentClimateName,currentClimateId,scheduledClimateName,scheduledClimateId,currentFanMode,auxHeatMode]
 		    if (forcePoll || (changeRarely == [:]) || !changeRarely.containsKey(tid) || (changeRarely[tid] != rarelyList)) { 
             	data += [
           			thermostatHold: thermostatHold,
@@ -3033,7 +3194,12 @@ def updateThermostatData() {
 					scheduledProgramId: scheduledClimateId,
 					scheduledProgram: scheduledClimateName,
                     thermostatFanMode: currentFanMode,
-                	fanMinOnTime: fanMinOnTime,
+                	fanMinOnTime: fanMinOnTime,                                        
+					auxHeatMode: auxHeatMode,				// Moved these down here, since they really didn't belong on the neverList
+                    humiditySetpoint: humiditySetpoint,		// ditto
+                    humidifierMode: humidifierMode,			// ditto
+                    dehumidifierMode: dehumidifierMode,		// ditto
+                    dehumiditySetpoint: dehumiditySetpoint,	// ditto
           		]
             	changeRarely[tid] = rarelyList
             	atomicState.changeRarely = changeRarely
@@ -3051,22 +3217,26 @@ def updateThermostatData() {
         // Send these first, as they generally are the reason anything else changes (so the thermostat's notification log makes sense)
 		if (forcePoll || runtimeUpdated || (tempHeatingSetpoint != 0.0) || (tempCoolingSetpoint != 999.0)) {
         	String wSymbol = atomicState.weather[tid]?.weatherSymbol?.toString()
-            def oftenList = [tempTemperature,occupancy,runtime.actualHumidity,tempHeatingSetpoint,tempCoolingSetpoint,wSymbol,tempWeatherTemperature,humiditySetpointDisplay,userPrecision]
+            def oftenList = [tempTemperature,occupancy,runtime.actualHumidity,tempHeatingSetpoint,tempCoolingSetpoint,wSymbol,tempWeatherTemperature,tempWeatherHumidity,tempWeatherDewpoint,
+            					tempWeatherPressure,humiditySetpointDisplay,userPrecision]
             def lastOList = []
             lastOList = changeOften[tid]
-            if (forcePoll || !lastOList || (lastOList.size() < 9)) lastOList = [999,'x',-1,-1,-1,-999,-999,-1,-1]
-            if (lastOList[8] != userPrecision) data+= [decimalPrecision: userPrecision,]															// send first so that DTH uses the latest setting
-            if (lastOList[0] != tempTemperature) data += [temperature: String.format("%.${apiPrecision}f", tempTemperature?.round(apiPrecision)),]
+            if (forcePoll || !lastOList || (lastOList.size() < 12)) lastOList = [999,'x',-1,-1,-1,-999,-999,-1,-1,-1,-1,-1]
+            if (lastOList[11] != userPrecision) data+= [decimalPrecision: userPrecision,]															// send first so that DTH uses the latest setting
+            if (lastOList[0] != tempTemperature) data += [temperature: String.format("%.${apiPrecision}f", roundIt(tempTemperature, apiPrecision)),]
             if (lastOList[1] != occupancy) data += [motion: occupancy,]
             if (lastOList[2] != runtime.actualHumidity) data += [humidity: runtime.actualHumidity,]
-            if (lastOList[7] != humiditySetpointDisplay) data += [humiditySetpointDisplay: humiditySetpointDisplay,]
+            if (lastOList[10] != humiditySetpointDisplay) data += [humiditySetpointDisplay: humiditySetpointDisplay,]
             // send these next two also when the userPrecision changes
             def needPrograms = false
-            if ((lastOList[3] != tempHeatingSetpoint) || (lastOList[8] != userPrecision)) { needPrograms = true; data += [heatingSetpoint: String.format("%.${userPrecision}f", tempHeatingSetpoint?.round(userPrecision)),] }
-            if ((lastOList[4] != tempCoolingSetpoint) || (lastOList[8] != userPrecision)) { needPrograms = true; data += [coolingSetpoint: String.format("%.${userPrecision}f", tempCoolingSetpoint?.round(userPrecision)),] }
-            if (lastOList[5] != wSymbol) data += [weatherSymbol: wSymbol]
-            if ((lastOList[6] != tempWeatherTemperature)|| (lastOList[8] != userPrecision)) data += [weatherTemperature: String.format("%0${userPrecision+2}.${userPrecision}f", tempWeatherTemperature?.round(userPrecision)),]
-           	changeOften[tid] = oftenList
+            if ((tempHeatingSetpoint != 0.0) && ((lastOList[3] != tempHeatingSetpoint) || (lastOList[11] != userPrecision))) { needPrograms = true; data += [heatingSetpoint: String.format("%.${userPrecision}f", roundIt(tempHeatingSetpoint, userPrecision)),] }
+            if ((tempCoolingSetpoint != 999.0) && ((lastOList[4] != tempCoolingSetpoint) || (lastOList[11] != userPrecision))) { needPrograms = true; data += [coolingSetpoint: String.format("%.${userPrecision}f", roundIt(tempCoolingSetpoint, userPrecision)),] }
+            if (wSymbol && (lastOList[5] != wSymbol)) data += [weatherSymbol: wSymbol]
+            if (tempWeatherTemperature && ((lastOList[6] != tempWeatherTemperature) || (lastOList[11] != userPrecision))) data += [weatherTemperature: String.format("%0${userPrecision+2}.${userPrecision}f", roundIt(tempWeatherTemperature, userPrecision)),]
+           	if (tempWeatherHumidity && (lastOList[7] != tempWeatherHumidity)) data += [weatherHumidity: tempWeatherHumidity,]
+            if (tempWeatherDewpoint && ((lastOList[8] != tempWeatherDewpoint) || (lastOList[11] != userPrecision))) data += [weatherDewpoint: String.format("%0${userPrecision+2}.${userPrecision}f",roundIt(tempWeatherDewpoint,userPrecision)),]
+            if (tempWeatherPressure && (lastOList[9] != tempWeatherPressure)) data += [weatherPressure: tempWeatherPressure,]
+            changeOften[tid] = oftenList
             atomicState.changeOften = changeOften
             // If the setpoints change, then double-check to see if the currently running Program has changed.
             // We do this by ensuring that the rest of the thermostat datasets (settings, program, events) are 
@@ -3087,7 +3257,7 @@ def updateThermostatData() {
 	}
     Integer nSize = tstatNames.size()
 	if (nSize > 1) tstatNames.sort()
-    LOG("${preText}Device data updated for ${nSize} thermostat${nSize!=1?'s':''} ${nSize!=0?tstatNames:''}", 2, null, 'info')
+    LOG("${preText}Updates for ${nSize} thermostat${nSize!=1?'s':''} ${nSize!=0?'('+tstatNames.toString()[1..-2]+')':''}", 2, null, 'info')
 }
 
 def getChildThermostatDeviceIdsString(singleStat = null) {
@@ -3135,7 +3305,7 @@ private refreshAuthToken(child=null) {
                 method: 'POST',
                 uri   : apiEndpoint,
                 path  : '/token',
-                query : [grant_type: 'refresh_token', code: "${atomicState.refreshToken}", client_id: smartThingsClientId],
+                query : [grant_type: 'refresh_token', refresh_token: "${atomicState.refreshToken}", client_id: smartThingsClientId],
         ]
 
         LOG("refreshParams = ${refreshParams}", 4, null, 'trace')
@@ -3154,10 +3324,11 @@ private refreshAuthToken(child=null) {
                 	}
                     
                     jsonMap = resp.data // Needed to work around strange bug that wasn't updating state when accessing resp.data directly
-                    LOG("resp.data = ${resp.data} -- jsonMap is? ${jsonMap}", 4, child)
+                    if (!jsonMap) LOG("resp.data = ${resp.data}", 2, child, 'warn')
+                  	//LOG("resp.json: ${resp.json}",2,child,'warn')			// we should get both
 
                     if(jsonMap) {
-                        LOG("resp.data == ${resp.data}, jsonMap == ${jsonMap}", 4, child)
+                        LOG("jsonMap: ${jsonMap}", 4, child)
 						
                         atomicState.refreshToken = jsonMap.refresh_token
                         
@@ -3250,21 +3421,6 @@ private refreshAuthToken(child=null) {
         	return false
     	} catch (Exception e) {
         	LOG("refreshAuthToken() - Exception: ${e}.", 1, child, "error")            
-            /*
-            atomicState.reAttempt = atomicState.reAttempt + 1
-	        if (atomicState.reAttempt > 3) {                       	
-   		    	apiLost("Too many retries (${atomicState.reAttempt - 1}) for token refresh.")        	    
-           	    return false
-	        } else {
-       			if ( canSchedule() ) {
-           			// atomicState.connected = "warn"
-					runIn(atomicState.reAttemptInterval, "refreshAuthToken") 
-				} else { 
-   	        		LOG("Unable to schedule refreshAuthToken, running directly", 2, child, "warn")
-					// atomicState.connected = "warn"
-        	    	refreshAuthToken(child) 
-   	        	}
-       		} */
             throw e
             return false
         }
@@ -3294,12 +3450,12 @@ def resumeProgram(child, String deviceId, resumeAll=true) {
     		// send the new heat/cool setpoints and ProgramId to the DTH - it will update the rest of the related displayed values itself
     		Integer apiPrecision = usingMetric ? 2 : 1					// highest precision available from the API
     		Integer userPrecision = getTempDecimals()						// user's requested display precision
-   			Double tempHeatAt = climate.heatTemp.toDouble()
-        	Double tempCoolAt = climate.coolTemp.toDouble()
+   			def tempHeatAt = climate.heatTemp
+        	def tempCoolAt = climate.coolTemp
         	def tempHeatingSetpoint = myConvertTemperatureIfNeeded( (tempHeatAt / 10.0), 'F', apiPrecision)
        		def tempCoolingSetpoint = myConvertTemperatureIfNeeded( (tempCoolAt / 10.0), 'F', apiPrecision)
-    		def updates = [	'heatingSetpoint':String.format("%.${userPrecision}f", tempHeatingSetpoint?.toDouble().round(userPrecision)),
-        					'coolingSetpoint':String.format("%.${userPrecision}f", tempCoolingSetpoint?.toDouble().round(userPrecision)),
+    		def updates = [	'heatingSetpoint':String.format("%.${userPrecision}f", roundIt(tempHeatingSetpoint, userPrecision)),
+        					'coolingSetpoint':String.format("%.${userPrecision}f", roundIt(tempCoolingSetpoint, userPrecision)),
                             'currentProgramName': climateName,
                             'currentProgram': climateName,
                        		'currentProgramId':climateId ]
@@ -3441,18 +3597,18 @@ def setVacationFanMinOnTime(child, deviceId, howLong) {
     
     if (deleteVacation(child, deviceId, evt.name)) { // apparently on order to change something in a vacation, we have to delete it and then re-create it..
   
-    def thermostatSettings = ''
-    def thermostatFunctions = '{"type":"createVacation","params":{"name":"' + evt.name + '","coolHoldTemp":"' + evt.coolHoldTemp + '","heatHoldTemp":"' + evt.heatHoldTemp + 
-    							'","startDate":"' + evt.startDate + '","startTime":"' + evt.startTime + '","endDate":"' + evt.endDate + '","endTime":"' + evt.endTime + 
-                                '","fan":"' + evt.fan + '","fanMinOnTime":"' + "${howLong}" + '"}}'
-    def jsonRequestBody = '{"selection":{"selectionType":"thermostats","selectionMatch":"' + deviceId + '"},"functions":['+thermostatFunctions+']'+thermostatSettings+'}'
-	
-    LOG("setVacationFanMinOnTime() for thermostat ${statName} - before sendJson() jsonRequestBody: ${jsonRequestBody}", 4, child, "info")
-    
-    def result = sendJson(child, jsonRequestBody)
-    LOG("setVacationFanMinOnTime(${howLong}) for thermostat ${statName} returned ${result}", 4, child, 'info') 
-	// if (result) atomicState.forcePoll = true 		// force next poll to get updated data
-    return result
+        def thermostatSettings = ''
+        def thermostatFunctions = '{"type":"createVacation","params":{"name":"' + evt.name + '","coolHoldTemp":"' + evt.coolHoldTemp + '","heatHoldTemp":"' + evt.heatHoldTemp + 
+                                    '","startDate":"' + evt.startDate + '","startTime":"' + evt.startTime + '","endDate":"' + evt.endDate + '","endTime":"' + evt.endTime + 
+                                    '","fan":"' + evt.fan + '","fanMinOnTime":"' + "${howLong}" + '"}}'
+        def jsonRequestBody = '{"selection":{"selectionType":"thermostats","selectionMatch":"' + deviceId + '"},"functions":['+thermostatFunctions+']'+thermostatSettings+'}'
+
+        LOG("setVacationFanMinOnTime() for thermostat ${statName} - before sendJson() jsonRequestBody: ${jsonRequestBody}", 4, child, "info")
+
+        def result = sendJson(child, jsonRequestBody)
+        LOG("setVacationFanMinOnTime(${howLong}) for thermostat ${statName} returned ${result}", 4, child, 'info') 
+        // if (result) atomicState.forcePoll = true 		// force next poll to get updated data
+        return result
     }
 }
 
@@ -3519,19 +3675,21 @@ def setHold(child, heating, cooling, deviceId, sendHoldType='indefinite', sendHo
         resumeProgram(child, deviceId, true)
     }
 	def isMetric = (getTemperatureScale() == "C")
-	int h = isMetric ? (cToF(heating) * 10) : (heating * 10)
-	int c = isMetric ? (cToF(cooling) * 10) : (cooling * 10)
+	def h = roundIt((isMetric ? (cToF(heating) * 10.0) : (heating * 10.0)), 0)		// better precision using BigDecimal round-half-up
+	def c = roundIt((isMetric ? (cToF(cooling) * 10.0) : (cooling * 10.0)), 0)
     
-	LOG("setHold() for thermostat ${statName} - h: ${heating}(${h}), c: ${cooling}(${c}), ${sendHoldType}, ${sendHoldHours}", 3, child, 'info')
+	LOG("setHold() for thermostat ${statName} - h: ${heating}(${h}), c: ${cooling}(${c}), ${sendHoldType}, ${sendHoldHours}", 2, child, 'trace')
     
     def theHoldType = sendHoldType // ? sendHoldType : whatHoldType()
 	if (theHoldType == 'nextTransition') {
     	// Check if setpoints are the same as currentClimateRef, if so, don't set a new hold
         // ResumeProgram above already sent the setpoint display values for the currentClimate to the DTH
-        int currHeatAt = child.device.currentValue('heatingSetpointDisplay')?.toInteger()
-        int currCoolAt = child.device.currentValue('coolingSetpointDisplay')?.toInteger()
-        if ((c==currCoolAt) && (h==currHeatAt)) { 
-        	LOG("setHold() for thermostat ${statName} requesting current setpoints; resuming", 3, child, 'info')
+        def currHeatAt = roundIt((isMetric ? (cToF(child.device.currentValue('heatingSetpoint').toBigDecimal()) * 10.0) : (child.device.currentValue('heatingSetpoint').toBigDecimal() * 10.0)), 0)		// better precision using BigDecimal round-half-up
+		def currCoolAt = roundIt((isMetric ? (cToF(child.device.currentValue('coolingSetpoint').toBigDecimal()) * 10.0) : (child.device.currentValue('coolingSetpoint').toBigDecimal() * 10.0)), 0)
+        LOG("setHold() - currHeat: ${currHeatAt}, currCool: ${currCoolAt}",2, child, 'trace')
+        // if ((c==currCoolAt) && (h==currHeatAt)) {
+        if ((cooling==currCoolAt) && (heating==currHeatAt)) {
+        	LOG("setHold() for thermostat ${statName} requesting current setpoints; ignoring", 3, child, 'info')
         	return true 
         }
     } else if (theHoldType == 'holdHours') {
@@ -3548,12 +3706,12 @@ def setHold(child, heating, cooling, deviceId, sendHoldType='indefinite', sendHo
     	// send the new heat/cool setpoints and ProgramId to the DTH - it will update the rest of the related displayed values itself
     	Integer apiPrecision = usingMetric ? 2 : 1					// highest precision available from the API
     	Integer userPrecision = getTempDecimals()						// user's requested display precision
-   		Double tempHeatAt = h.toDouble()
-        Double tempCoolAt = c.toDouble()
+   		def tempHeatAt = h //.toBigDecimal()
+        def tempCoolAt = c //.toBigDecimal()
         def tempHeatingSetpoint = myConvertTemperatureIfNeeded( (tempHeatAt / 10.0), 'F', apiPrecision)
        	def tempCoolingSetpoint = myConvertTemperatureIfNeeded( (tempCoolAt / 10.0), 'F', apiPrecision)
-    	def updates = ['heatingSetpoint':String.format("%.${userPrecision}f", tempHeatingSetpoint?.toDouble().round(userPrecision)),
-        			   'coolingSetpoint':String.format("%.${userPrecision}f", tempCoolingSetpoint?.toDouble().round(userPrecision)),
+    	def updates = ['heatingSetpoint':String.format("%.${userPrecision}f", roundIt(tempHeatingSetpoint, userPrecision)),
+        			   'coolingSetpoint':String.format("%.${userPrecision}f", roundIt(tempCoolingSetpoint, userPrecision)),
                        'currentProgramName': 'Hold: Temp'
                       ]
         LOG("setHold() for thermostat ${statName} - ${updates}",3,null,'info')
@@ -3566,7 +3724,8 @@ def setHold(child, heating, cooling, deviceId, sendHoldType='indefinite', sendHo
 // Should only be called by child devices, and they MUST provide sendHoldType and sendHoldHours as of version 1.2.0
 def setFanMode(child, fanMode, fanMinOnTime, deviceId, sendHoldType='indefinite', sendHoldHours=2) {
 	String statName = getThermostatName(deviceId)
-	LOG("setFanMode(${fanMode}) for for thermostat ${statName}", 5, null, 'trace')    
+	LOG("setFanMode(${fanMode}) for for thermostat ${statName}", 5, null, 'trace') 
+    def isMetric = (getTemperatureScale() == "C")
     
     def currentThermostatHold = child.device.currentValue('thermostatHold') 
     if (currentThermostatHold == 'vacation') {
@@ -3580,8 +3739,10 @@ def setFanMode(child, fanMode, fanMinOnTime, deviceId, sendHoldType='indefinite'
     // Per this thread: http://developer.ecobee.com/api/topics/qureies-related-to-setfan
     // def extraParams = [isTemperatureRelative: "false", isTemperatureAbsolute: "false"]
     // And then these values are ignored when setting only the fan
-    def h = child.device.currentValue('heatingSetpointDisplay')			// use the device's values, not the ones from our last API refresh
-    def c = child.device.currentValue('coolingSetpointDisplay')		// BUT- IF changing Fan Mode while in a Hold, maybe we should be overloading the hold instead of cancelling it?
+    // use the device's values, not the ones from our last API refresh
+    // BUT- IF changing Fan Mode while in a Hold, maybe we should be overloading the hold instead of cancelling it?
+   	def h = roundIt((isMetric ? (cToF(child.device.currentValue('heatingSetpoint').toBigDecimal()) * 10.0) : (child.device.currentValue('heatingSetpoint').toBigDecimal() * 10.0)), 0)		// better precision using BigDecimal round-half-up
+	def c = roundIt((isMetric ? (cToF(child.device.currentValue('coolingSetpoint').toBigDecimal()) * 10.0) : (child.device.currentValue('coolingSetpoint').toBigDecimal() * 10.0)), 0)
     
     def theHoldType = sendHoldType // ? sendHoldType : whatHoldType(child)
     if (theHoldType == 'holdHours') {
@@ -3666,12 +3827,12 @@ def setProgram(child, program, String deviceId, sendHoldType='indefinite', sendH
     	// send the new heat/cool setpoints and ProgramId to the DTH - it will update the rest of the related displayed values itself
     	Integer apiPrecision = usingMetric ? 2 : 1					// highest precision available from the API
     	Integer userPrecision = getTempDecimals()						// user's requested display precision
-   		Double tempHeatAt = climate.heatTemp.toDouble()
-        Double tempCoolAt = climate.coolTemp.toDouble()
+   		def tempHeatAt = climate.heatTemp
+        def tempCoolAt = climate.coolTemp
         def tempHeatingSetpoint = myConvertTemperatureIfNeeded( (tempHeatAt / 10.0), 'F', apiPrecision)
        	def tempCoolingSetpoint = myConvertTemperatureIfNeeded( (tempCoolAt / 10.0), 'F', apiPrecision)
-    	def updates = ['heatingSetpoint':String.format("%.${userPrecision}f", tempHeatingSetpoint?.toDouble().round(userPrecision)),
-        			   'coolingSetpoint':String.format("%.${userPrecision}f", tempCoolingSetpoint?.toDouble().round(userPrecision)),
+    	def updates = ['heatingSetpoint':String.format("%.${userPrecision}f", roundIt(tempHeatingSetpoint, userPrecision)),
+        			   'coolingSetpoint':String.format("%.${userPrecision}f", roundIt(tempCoolingSetpoint, userPrecision)),
                        'currentProgram': program,
                        'currentProgramId':climateRef]
         LOG("setProgram() for thermostat ${statName} ${updates}",3,null,'info')
@@ -3757,7 +3918,7 @@ def deleteSensorFromProgram(child, deviceId, sensorId, programId) {
                     program.climates[c].sensors = program.climates[c].sensors - program.climates[c].sensors[s]   
 					climateChange[deviceId] = program
 					atomicState.climateChange = climateChange		// save for later 
-                    runIn(2, 'updateClimates', [data: [deviceId: deviceId]])
+                    runIn(2, 'updateClimates', [data: [deviceId: deviceId, child: child]])
                     LOG("deleteSensorFromProgram() - ${sensName} deletion from ${programId.capitalize()} program on thermostat ${statName} queued successfully", 4, child, 'info')
            			return true
             	}
@@ -3771,25 +3932,93 @@ def deleteSensorFromProgram(child, deviceId, sensorId, programId) {
     return true
 }
 
+def setProgramSetpoints(child, deviceId, programName, heatingSetpoint = null, coolingSetpoint = null) {
+	String statName = getThermostatName( deviceId )
+	LOG("setProgramSetpoints(${deviceId} (${statName}): ${programName} heatSP: ${heatingSetpoint}, coolSP: ${coolingSetpoint})",3,child,'trace')
+    
+	def program
+    def climateChange = atomicState.climateChange
+    if (climateChange && climateChange[deviceId]) {
+    	program = climateChange[deviceId]			// already have some edits underway
+    } else {
+    	if (!climateChange) climateChange = [:]
+		program = atomicState.program[deviceId]		// starting new edits
+    }
+    if (!program) {
+    	return false
+    }
+    
+    // convert C temps to F
+    def isMetric = (getTemperatureScale() == "C")
+	def ht = (heatingSetpoint && heatingSetpoint.isNumber()) ? (roundIt((isMetric ? (cToF(heatingSetpoint) * 10.0) : (heatingSetpoint * 10.0)), 0)) : null		// better precision using BigDecimal round-half-up
+	def ct = (coolingSetpoint && coolingSetpoint.isNumber()) ? (roundIt((isMetric ? (cToF(coolingSetpoint) * 10.0) : (coolingSetpoint * 10.0)), 0)) : null
+    
+    // enforce the minimum delta
+    def delta = atomicState.settings ? atomicState.settings[deviceId]?.heatCoolMinDelta : null
+    if ((delta != null) && (ht != null) && (ct != null) && ((ct - ht) < delta)) {
+    	LOG("setProgramSetpoints() - Error: heating/cooling setpoints must be at least ${delta/10}°F apart.",1,child,'error')
+        return false
+    }
+    
+        
+    int c = 0
+    while ( program.climates[c] ) {	
+    	if (program.climates[c].name == programName) { // found the program we want to change
+            def heatTemp = program.climates[c]?.heatTemp
+            def coolTemp = program.climates[c]?.coolTemp
+            def adjusted = ''
+            // If we have both ht & ct, we already know the delta is good
+            // but if we only have 1, we need to determine the valid value for the other
+			if (!ct) {
+            	ct = (!coolTemp || ((coolTemp - ht) < delta)) ? (ht + delta) : coolTemp
+                if(!coolingSetpoint || (ct != cooltemp)) adjusted = 'cool'
+            } else if (!ht) {
+            	ht = (!heatTemp || ((ct - heatTemp) < delta)) ? (ct - delta) : heatTemp
+                if (!heatingSetpoint || (ht != heatTemp)) adjusted = 'heat'
+            }
+            LOG("setProgramSetpoints() - heatingSetpoint: ${ht/10}°F ${adjusted=='heat'?'(adjusted)':''}, coolingSetpoint: ${ct/10}°F ${adjusted=='cool'?'(adjusted)':''}${adjusted?', minDelta: '+(delta/10).toString()+'°F':''}",2,child,'info')
+            program.climates[c].heatTemp = ht
+            program.climates[c].coolTemp = ct
+            climateChange[deviceId] = program
+            atomicState.climateChange = climateChange		// save for later 
+            if (updateClimatesDirect( deviceId, child )) {
+            	LOG("setProgramSetpoints(): ${programName} setpoints changed successfully", 2, child, 'info')
+            	return true
+            } else {
+            	LOG("setProgramSetpoints(): ${programName} setpoints change failed", 1, child, 'warn')
+                return false
+            }
+        }
+        c++
+    }
+    // didn't find the specified climate
+    LOG("setProgramSetpoints(): ${programName} not found on thermostat ${statName}", 1, child, 'warn')
+    return false
+}
+
 def updateClimates(data) {
-	def deviceId = data.deviceId
+	updateClimatesDirec(data.deviceId, data.child)
+}
+
+def updateClimatesDirect(deviceId, child) {
     def statName = getThermostatName( deviceId )
-	LOG("Updating Program Sensors for ${statName}", 4, null, 'info')
+	LOG("Updating Program settings for ${statName}", 4, child, 'info')
     def climateChange = atomicState.climateChange
     def program
 	if (climateChange && climateChange[deviceId]) program = climateChange[deviceId]
-
+	def result
     if (program) {
     	def programJson = JsonOutput.toJson(program)
         def thermostatSettings = ',"thermostat":{"program":' + programJson +'}'
     	def thermostatFunctions = ''
     	def jsonRequestBody = '{"selection":{"selectionType":"thermostats","selectionMatch":"' + deviceId + '"},"functions":['+thermostatFunctions+']'+thermostatSettings+'}'
-        def result = sendJson(null, jsonRequestBody)
-    	LOG("Updating Program Sensors for ${statName}) returned ${result}", 2, null, result?'info':'warn')
+        result = sendJson(child, jsonRequestBody)
+    	LOG("Updating Program settings for ${statName} returned ${result}", 4, child, result?'info':'warn')
         climateChange[deviceId] = null
         atomicState.climateChange = climateChange
     }
-    atomicState.forcePoll = true
+    // atomicState.forcePoll = true
+    return result    
 }
 
 // API Helper Functions
@@ -3851,7 +4080,7 @@ private def sendJson(child=null, String jsonBody) {
             atomicState.action = ""					// we don't want refreshAuthToken to sendJsonRetry - we will retry ourselves instead
            	LOG( "Refreshing your auth_token!", 4)
            	if ( refreshAuthToken() ) { 
-                LOG( "sendJson() - Auth_token refreshed", 2, null, 'info')
+                LOG( "Sending: Auth_token refreshed", 2, null, 'info')
                 if (!atomicState.sendJsonRetry) {
                 	atomicState.sendJsonRetry = true 		// retry only once
                     LOG( "sendJson() - Retrying once...", 2, null, 'info')
@@ -3860,7 +4089,7 @@ private def sendJson(child=null, String jsonBody) {
                     atomicState.sendJsonRetry = false
                 }
             } else {
-                LOG( "sendJson() - Auth_token refresh failed", 1, null, 'error') 
+                LOG( "Sending: Auth_token refresh failed", 1, null, 'error') 
             }
         } else {
         	LOG("sendJson() - HttpResponseException occurred. Exception info: ${e} StatusCode: ${e.statusCode} || ${e.response.data.status.code}", 1, null, "error")
@@ -3891,7 +4120,6 @@ private def sendJson(child=null, String jsonBody) {
         result = false
         throw e
 	}
-    
 	return result
 }
 
@@ -3967,11 +4195,11 @@ private def LOG(message, level=3, child=null, String logType='debug', event=fals
 	}
     // if ( debugLevel(0) ) { return }
 	if ( debugLevel(5) ) { prefix = 'LOG: ' }
-	if ( dbgLevel ) { 
+	//if ( dbgLevel ) { 
     	log."${logType}" "${prefix}${message}"        
-        if (event) { debugEvent("${message}", displayEvent) }
+        if (event) { debugEvent(message, displayEvent) }
         if (child) { debugEventFromParent(child, message) }
-	}    
+	//}    
 }
 
 private def debugEvent(message, displayEvent = false) {
@@ -3994,18 +4222,27 @@ private def debugEventFromParent(child, message) {
 // TODO: Create a more generic push capability to send notifications
 // send both push notification and mobile activity feeds
 private def sendPushAndFeeds(notificationMessage) {
-	LOG("sendPushAndFeeds >> notificationMessage: ${notificationMessage}", 1, null, "warn")
-	LOG("sendPushAndFeeds >> atomicState.timeSendPush: ${atomicState.timeSendPush}", 1, null, "warn")
+	LOG("Notification Message: ${notificationMessage}", 2, null, "trace")
+	LOG("Notification Time: ${atomicState.timeSendPush}", 2, null, "info")
     
     // notification is sent to remind user no more than once per hour
     Boolean sendNotification = (atomicState.timeSendPush && ((now() - atomicState.timeSendPush) < 3600000)) ? false : true
     if (sendNotification) {
     	String msg = "Your ${location.name} Ecobee${settings.thermostats.size()>1?'s':''} " + notificationMessage		// for those that have multiple locations, tell them where we are
-        if (location.contactBookEnabled && settings.recipients) {
-			sendNotificationToContacts(msg, settings.recipients, [event: true]) 
-    	} else if (phone) { // check that the user did select a phone number
-    		sendSms(phone, msg)
+        if (phone) { // check that the user did select a phone number
+            if ( phone.indexOf(";") > 0){
+                def phones = phone.split(";")
+                for ( def i = 0; i < phones.size(); i++) {
+                    LOG("Sending SMS ${i+1} to ${phones[i]}",2,null,'info')
+                    sendSmsMessage(phones[i], msg)
+                }
+                sendNotificationEvent( msg )
+            } else {
+                LOG("Sending SMS to ${phone}",2,null,'info')
+                sendSms(phone, msg)
+            }
         } else {
+        	LOG("No phones specified, sending Push to everyone",2,null,'warn')
 			sendPush(msg)
     	}
         sendActivityFeeds(notificationMessage)
@@ -4023,6 +4260,11 @@ private def sendActivityFeeds(notificationMessage) {
 // Helper Functions
 // Creating my own as it seems that the built-in version only works for a device, NOT a SmartApp
 def myConvertTemperatureIfNeeded(scaledSensorValue, cmdScale, precision) {
+
+	if (scaledSensorValue == null) {
+    	LOG("Illegal sensorValue (null)", 2, null, "error")
+        return null
+    }
 	if ( (cmdScale != "C") && (cmdScale != "F") && (cmdScale != "dC") && (cmdScale != "dF") ) {
     	// We do not have a valid Scale input, throw a debug error into the logs and just return the passed in value
         LOG("Invalid temp scale used: ${cmdScale}", 2, null, "error")
@@ -4038,28 +4280,36 @@ def myConvertTemperatureIfNeeded(scaledSensorValue, cmdScale, precision) {
 	LOG("About to convert/scale temp: ${scaledSensorValue}", 5, null, "trace", false)
 	if (cmdScale == getTemperatureScale() ) {
     	// The platform scale is the same as the current value scale
-        returnSensorValue = scaledSensorValue.round(precision)
+        //returnSensorValue = scaledSensorValue.round(precision)
+        returnSensorValue = roundIt(scaledSensorValue, precision)
     } else if (cmdScale == "F") {		    	
-    	returnSensorValue = fToC(scaledSensorValue).round(precision)
+    	//returnSensorValue = fToC(scaledSensorValue).round(precision)
+        returnSensorValue = roundIt(fToC(scaledSensorValue), precision)
     } else {
-    	returnSensorValue = cToF(scaledSensorValue).round(precision)
+    	//returnSensorValue = cToF(scaledSensorValue).round(precision)
+        returnSensorValue = roundIt(cToF(scaledSensorValue), precision)
     }
     LOG("returnSensorValue == ${returnSensorValue}", 5, null, "trace", false)
     return returnSensorValue
 }
-
+private roundIt( value, decimals=0 ) {
+	return (value == null) ? null : value.toBigDecimal().setScale(decimals, BigDecimal.ROUND_HALF_UP) 
+}
+private roundIt( BigDecimal value, decimals=0) {
+    return (value == null) ? null : value.setScale(decimals, BigDecimal.ROUND_HALF_UP) 
+}
 def wantMetric() {
 	return (getTemperatureScale() == "C")
 }
 
-private Double cToF(temp) {
+private cToF(temp) {
 	if (debugLevel(5)) LOG("cToF entered with ${temp}", 5, null, "info")
-	return (temp * 1.8 + 32) as Double
+	if (temp) { return (temp * 1.8 + 32) } else { return null } 
     // return celsiusToFahrenheit(temp)
 }
-private Double fToC(temp) {	
+private fToC(temp) {	
 	if (debugLevel(5)) LOG("fToC entered with ${temp}", 5, null, "info")
-	return (temp - 32) / 1.8 as Double
+	if (temp) { return (temp - 32) / 1.8 } else { return null } 
     // return fahrenheitToCelsius(temp)
 }
 
@@ -4161,6 +4411,10 @@ private def getTimeZone() {
 private String getZipCode() {
 	// default to the SmartThings location's timeZone (if there is one)
 	String myZipCode = location?.zipCode
+    if (myZipCode == null) {
+    	LOG("*** INITIALIZATION ERROR *** PLEASE SET POSTAL CODE FOR LOCATION '${location.name}'",1,null,'warn')
+        atomicState.zipCode == null
+    }
 	if ((atomicState.zipCode == null) || atomicState.forcePoll) {
         def zipCodes = []
         settings.thermostats?.each{
@@ -4238,7 +4492,7 @@ private def apiLost(where = "[where not specified]") {
 }
 
 def notifyApiLost() {
-	def notificationMessage = "${settings.thermostats.size()>1?'are':'is'} disconnected from SmartThings/Ecobee, because the access credential changed or was lost. Please go to the Ecobee Suite Manager SmartApp and re-enter your account login credentials."
+	def notificationMessage = "${settings.thermostats.size()>1?'are':'is'} disconnected from SmartThings/Ecobee. Please go to the Ecobee Suite Manager and re-enter your Ecobee account login credentials."
     if ( atomicState.connected == "lost" ) {
     	generateEventLocalParams()
 		sendPushAndFeeds(notificationMessage)
@@ -4282,42 +4536,11 @@ def getAvailablePrograms(thermostat) {
     String devId = getChildThermostatDeviceIdsString(thermostat)
     // LOG("getAvailablePrograms() Looking for ecobee thermostat ${devId}", 5, thermostat, "trace")
 
-    def climates = atomicState.program[devId].climates
+    def climates = atomicState.program[devId]?.climates
     
     return climates?.collect { it.name }
 }
 
-/*
-// Deprecated in version 1.20 - holdType MUST be provided by child thermostat making calls to set Holds
-//
-private def whatHoldType(child) {
-	def myHoldType = getHoldType()
-    switch (getHoldType()) {
-    	case 'Until I Change':
-        case 'Permanent':
-        	return 'indefinite'
-            break;
-            
-        case 'Until Next Program':
-        case 'Temporary':
-        	return 'nextTransition'
-            break;
-            
-        case '2 Hours':
-        case '4 Hours':
-        case 'Specified Hours':
-        	return 'holdHours'
-            break;
-        
-        case 'Thermostat Setting':
-        default:
-        	return 'indefinite'
-    }
-	// def sendHoldType = (myHoldType=='Until Next Program' || myHoldType=='Temporary') ? 'nextTransition' : (( myHoldType=='Until I Change' || myHoldType=='Permanent') ? 'indefinite' : 'holdHours')
-	// LOG("Entered whatHoldType() with ${sendHoldType}  settings.holdType == ${settings.holdType}")
-    // return sendHoldType
-}
-*/
 private def debugLevel(level=3) {
     Integer dbgLevel = getDebugLevel()
     return (dbgLevel == 0) ? false : (dbgLevel >= level?.toInteger())
@@ -4353,4 +4576,76 @@ private String fixDateTimeString( String dateStr, String timeStr, String thermos
     	resultStr = myTime ? "${myDate} at ${myTime}" : "${myDate}"
     }
     return resultStr
+}
+
+private def getDeviceId(networkId) {
+	// def deviceId = networkId.split(/\./).last()	
+    // LOG("getDeviceId() returning ${deviceId}", 4, null, 'trace')
+    // return deviceId
+    return networkId.split(/\./).last()
+}
+
+// Reservation Management Functions
+// Make a reservation for me
+void makeReservation( statId, childId, String type='modeOff' ) {
+    def childName = getChildAppName( childId )
+	if (!childName) {
+    	LOG("Illegal reservation attempt using childId: ${childId} - caller is not my child.",1,null,'warn')
+    }
+    def reservations = atomicState.reservations
+    if (!reservations) reservations = [:]
+    if (!reservations?.containsKey(statId)) {
+    	reservations."${statId}" = [:]
+    }
+    if (!reservations."${statId}"?.containsKey(type)) {				// allow for ANY type of reservations
+        reservations."${statId}"."${type}" = []
+    }
+    if (!reservations."${statId}"."${type}"?.contains(childId)) {
+    	reservations."${statId}"."${type}" << childId
+        atomicState.reservations = reservations
+        LOG("'${type}' reservation created for ${childName}",2,null,'info')
+    }
+}
+// Cancel my reservation
+void cancelReservation( statId, childId, String type='modeOff') {
+    def childName = getChildAppName( childId )
+    if (!childName) childName = childId
+    def reservations = atomicState.reservations
+    if (reservations?."${statId}"?."${type}"?.contains(childId)) {
+    	reservations."${statId}"."${type}" = reservations."${statId}"."${type}" - [childId]
+        atomicState.reservations = reservations
+        LOG("'${type}' reservation cancelled for ${childName}",2,null,'info')
+    }
+}
+// Do I have a reservation?
+Boolean haveReservation( statId, childId, String type='modeOff') {
+    def reservations = atomicState.reservations
+	return (reservations?."${statId}"?."${type}"?.contains(childId))
+}
+// Do any Apps have reservations?
+Boolean anyReservations( statId, String type='modeOff') {
+	def reservations = atomicState.reservations
+	return (reservations?."${statId}"?.containsKey(type)) ? (reservations."${statId}"."${type}".size() != 0) : false
+}
+// How many apps have reservations?
+Integer countReservations(statId, String type='modeOff') {
+	def reservations = atomicState.reservations
+	return (reservations?."${statId}"?.containsKey(type)) ? reservations."${statId}"."${type}".size() : 0
+}
+// Get the list of app IDs that have reservations
+List getReservations(statId, String type='modeOff') {
+	def reservations = atomicState.reservations
+    return (reservations?."${statId}"?.containsKey(type)) ? reservations."${statId}"."${type}" : []
+}
+// Get the list of app Names that have reservations
+List getGuestList(statId, String type='modeOff') {
+	def reservations = atomicState.reservations
+    if (reservations?."${statId}"?.containsKey(type)) {
+    	def guestList = []
+        reservations."${statId}"."${type}".each {
+        	guestList << getChildAppName( it )
+        }
+        return guestList
+    }
+    return []
 }
